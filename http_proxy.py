@@ -4,6 +4,7 @@ import argparse
 
 LISTEN_ADDRESS = ''
 
+
 class ProxyServer(object):
 
     def __init__(self, port, logfile, ipv6=False):
@@ -15,6 +16,12 @@ class ProxyServer(object):
         sock = socket.socket(sock_type, socket.SOCK_STREAM)
         sock.bind((LISTEN_ADDRESS, port))
         return sock
+
+    def start():
+        while True:
+            clientSock, clientAddr = self.sock.accept()
+            connectionContext(clientSock)
+            clientSock.close()
 
 
 def main():
