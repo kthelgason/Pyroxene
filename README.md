@@ -10,5 +10,7 @@ Authors
 ========
 
 Kári Tristan Helgason (kari12@ru.is)
+
 Starkaður Hróbjartsson (starkadur12@ru.is)
+
 Jóhann Eiríksson (johanne12@ru.is)
