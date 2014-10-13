@@ -4,6 +4,10 @@ import argparse
 
 LISTEN_ADDRESS = ''
 
+class ConnectionContext(object):
+
+    def __init__(self, client):
+        pass
 
 class ProxyServer(object):
 
@@ -15,9 +19,10 @@ class ProxyServer(object):
         sock_type = socket.AF_INET6 if ipv6 else socket.AF_INET
         sock = socket.socket(sock_type, socket.SOCK_STREAM)
         sock.bind((LISTEN_ADDRESS, port))
+        sock.listen(5)
         return sock
 
-    def start():
+    def start(self):
         while True:
             clientSock, clientAddr = self.sock.accept()
             connectionContext(clientSock)
@@ -31,6 +36,7 @@ def main():
     parser.add_argument('logfile', help='The logfile to log connections to')
     parser.add_argument('--ipv6', action="store_true", help="Use IPv6")
     args = parser.parse_args()
+    ProxyServer(args.port, args.logfile, args.ipv6).start()
 
     return 0
 
