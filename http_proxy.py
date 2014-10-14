@@ -68,96 +68,113 @@ class Logger(object):
 
 
 class HTTP_Message(object):
-    def __init__(self):
-        # Class is abstract, should not be instantiated directly
+    def __init__(self, headers, data):
         pass
-
-    def parse_headers(self, header_lines):
-        headers = {}
-        for header in header_lines:
-            parts = header.split(':', 1)
-            key = parts[0]
-            value = parts[1].strip()
-            headers[key] = value
-        return headers
 
     def get_header(self, key):
         return self.headers.get(key)
 
-    def read_data(self):
-        content_length = self.get_header("Content-Length")
-        if content_length:
-            data = self.f.read(content_length)
-            return data
-        return None
-
-
-class Request(HTTP_Message):
-    def __init__(self, f):
-        self.method, self.resource, self.protocol_version = req_line.split()
-        self.headers = self.parse_headers(headers)
-        self.f = f
-        self.data = self.read_data()
-
     def toRaw(self):
-        raw = ' '.join((self.method, self.resource, self.protocol_version))
-        raw += '\r\n'
+        raw = ''
         for (key,value) in self.headers.iteritems():
-            raw += key + ": " + value + '\r\n'
-        raw += '\r\n'
+            raw += key + ": " + value + CRLF
+        raw += CRLF
         if self.data:
             raw += self.data
         return raw
 
 
-class HTTPMessageFactory(object):
-    def __init__(self):
-        pass
+class Request(HTTP_Message):
+    def __init__(self, req_line, headers, data):
+        self.method, self.resource, self.protocol_version = req_line
+        self.headers = headers
+        self.data = data
 
+    def toRaw(self):
+        raw = ' '.join((self.method, self.resource, self.protocol_version))
+        raw += super(Request, self).toRaw()
+        return raw
+
+
+class Response(HTTP_Message):
+    def __init__(self, resp_line, headers, data):
+        self.protocol_version, self.status, self.reason = resp_line
+        self.headers = headers
+        self.data = data
+
+    def toRaw(self):
+        raw = ' '.join((self.protocol_version, self.status, self.reason))
+        raw += super(Response, self).toRaw()
+        return raw
+
+
+class HTTPMessageFactory(object):
+
+    @classmethod
     def create_message(self, from_socket):
-        headers = []
-        message_line = from_socket.readline().split(" ", 2)
+        f = from_socket.makefile('rb')
+        headers = {}
+        message_line = f.readline().split(" ", 2)
+
+        if message_line == ['']:
+            raise Exception
+
         if message_line[0] in SUPPORTED_PROTOCOLS:
             type_ = "response"
         elif message_line[0] in SUPPORTED_METHODS:
             type_ = "request"
         else:
+            print(message_line[0])
             pass
             # TODO: malformed request 400 error
 
-        header = from_socket.readline()
+        header = f.readline()
         while header != CRLF:
-            headers.append(header)
-            header = from_socket.readline()
+            parts = header.split(':', 1)
+            key = parts[0]
+            value = parts[1].strip()
+            headers[key] = value
+            header = f.readline()
 
-        length = self.get_header("Content-Length")
+        length = headers.get("Content-Length")
+        encoding = headers.get("Transfer-Encoding")
+        payload = CRLF * 2
+
         if length:
-            amt = int(length)
+            amount = int(length)
             s = []
-            while length > 0:
-                chunk = from_socket.read(length)
+            while amount > 0:
+                chunk = f.read(amount)
                 if not chunk:
                     break
                 s.append(chunk)
-                amt -= len(chunk)
+                amount -= len(chunk)
             payload = ''.join(s)
 
+        elif encoding and encoding == "chunked":
+            # Read first line of chunked response
+            l = f.readline()
+            s = [l]
+            try:
+                content_len = int(l, 16)
+                while(content_len > 0):
+                    chunk = f.read(content_len)
+                    s.append(chunk)
+                    if not chunk:
+                        break
+                    l = f.readline()
+                    l = f.readline()
+                    s.append(l)
+                    content_len = int(l, 16)
+            except Exception, e:
+                print(e)
+            s.append(CRLF)
+            payload = ''.join(s)
 
+        args = (message_line, headers, payload)
+        f.close()
+        return Request(*args) if type_ == "request" else Response(*args)
 
-class Response(HTTP_Message):
-    def __init__(self, resp_line, headers, data):
-        self.protocol_version, self.status, self.reason = resp_line.split(' ', 2)
-        self.headers = self.parse_headers(headers)
-        self.data = data
-
-    def toRaw(self):
-        raw = ' '.join((self.protocol_version, self.status, self.reason))
-        raw += '\r\n'
-        for (key,value) in self.headers.iteritems():
-            raw += key + ": " + value + '\r\n'
-        raw += '\r\n'
-        raw += self.data
-        return raw
 
 
 class ConnectionContext(object):
@@ -165,33 +182,15 @@ class ConnectionContext(object):
     def __init__(self, client_sock, client_addr):
         self.client_sock = client_sock
         self.client_addr = client_addr
-        self.request_headers = {}
-        self.response_headers = {}
+        self.server_sock = None
+        print("New connection from %s" % client_addr[0])
         self.proxy_request()
 
     def connect_to_server(self, host):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        host_addr = socket.gethostbyname(host)
-        sock.connect((host_addr, 80))
-        return sock
-
-    def split_message(self, message):
-        line, rest = message.split('\r\n', 1)
-        headers, data = rest.split('\r\n\r\n', 1)
-        return line, headers, data
-
-    def read_request(self):
-        headers = []
-        f = self.client_sock.makefile('rb')
-        return Request(f)
-
-        line, headers, data = self.split_message(message)
-        return Request(line, headers, data)
-
-    def parse_response(self, message):
-        line, headers, data = self.split_message(message)
-        return Response(line, headers, data)
-
+        self.server_addr = socket.gethostbyname(host)
+        sock.connect((self.server_addr, 80))
+        self.server_sock = sock
 
     def send_unsupported_method_error(self):
         print("Unsupported Method!")
@@ -199,10 +198,28 @@ class ConnectionContext(object):
     def send_unsupported_version_error(self):
         print("Unsupported Protocol Version!")
 
-    def proxy_request(self):
-        req = self.read_request()
-        print(req.toRaw())
+    def close_sockets(self):
+        self.client_sock.close()
+        if self.server_sock:
+            self.server_sock.close()
+        print("Closing connection.")
 
+    def proxy_request(self):
+        while True:
+            try:
+                req = HTTPMessageFactory.create_message(self.client_sock)
+                self.connect_to_server(req.get_header("Host"))
+                self.server_sock.send(req.toRaw())
+                resp = HTTPMessageFactory.create_message(self.server_sock)
+                connection = resp.get_header("Connection")
+                self.client_sock.send(resp.toRaw())
+                if connection and connection == "close":
+                    break
+            except Exception, e:
+                print("aw =( ")
+                break
+
+        self.close_sockets()
 
 
 class ProxyServer(object):
@@ -216,7 +233,7 @@ class ProxyServer(object):
         sock = socket.socket(sock_type, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((LISTEN_ADDRESS, port))
-        sock.listen(5)
+        sock.listen(1)
         return sock
 
     def start(self):
