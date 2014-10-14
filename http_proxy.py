@@ -12,6 +12,7 @@ LISTEN_ADDRESS = ''
 BUFSIZE = 8192
 SUPPORTED_METHODS = ['GET', 'POST', 'HEAD']
 SUPPORTED_VERSIONS = ['HTTP/1.1']
+CRLF = '\r\n'
 
 class LoggerException(Exception):
     pass
@@ -66,13 +67,13 @@ class Logger(object):
                 f.write(timestamp + self.logfmt % args)
 
 class HTTP_Message(object):
-    def __init__(self, start_line, headers, data):
+    def __init__(self):
         # Class is abstract, should not be instantiated directly
         pass
 
     def parse_headers(self, header_lines):
         headers = {}
-        for header in header_lines.split('\r\n'):
+        for header in header_lines:
             parts = header.split(':', 1)
             key = parts[0]
             value = parts[1].strip()
@@ -82,11 +83,19 @@ class HTTP_Message(object):
     def get_header(self, key):
         return self.headers.get(key)
 
+    def read_data(self):
+        content_length = self.get_header("Content-Length")
+        if content_length:
+            data = self.f.read(content_length)
+            return data
+        return None
+
 class Request(HTTP_Message):
-    def __init__(self, req_line, headers, data):
+    def __init__(self, f):
         self.method, self.resource, self.protocol_version = req_line.split()
         self.headers = self.parse_headers(headers)
-        self.data = data
+        self.f = f
+        self.data = self.read_data()
 
     def toRaw(self):
         raw = ' '.join((self.method, self.resource, self.protocol_version))
@@ -94,8 +103,30 @@ class Request(HTTP_Message):
         for (key,value) in self.headers.iteritems():
             raw += key + ": " + value + '\r\n'
         raw += '\r\n'
-        raw += self.data
+        if self.data:
+            raw += self.data
         return raw
+
+class HTTPMessageFactory(object):
+    def __init__(self):
+        pass
+
+    def create_message(self, from_socket):
+        headers = []
+        message_line = f.readline().split(" ", 2)
+        if message_line[0] in SUPPORTED_PROTOCOLS:
+            type_ = "response"
+        elif message_line[0] in SUPPORTED_METHODS:
+            type_ = "request"
+        else:
+            pass
+            # TODO: malformed request 400 error
+
+        data = f.readline()
+        while data != CRLF:
+            headers.append(data)
+            data = f.readline()
+
 
 
 class Response(HTTP_Message):
@@ -130,17 +161,15 @@ class ConnectionContext(object):
         return sock
 
     def split_message(self, message):
-        """
-         HTTP-message = start-line CRLF
-                        *( header-field CRLF )
-                        CRLF
-                        [ message-body ]CRLF
-        """
         line, rest = message.split('\r\n', 1)
         headers, data = rest.split('\r\n\r\n', 1)
         return line, headers, data
 
-    def parse_request(self, message):
+    def read_request(self):
+        headers = []
+        f = self.client_sock.makefile('rb')
+        return Request(f)
+
         line, headers, data = self.split_message(message)
         return Request(line, headers, data)
 
@@ -156,35 +185,10 @@ class ConnectionContext(object):
         print("Unsupported Protocol Version!")
 
     def proxy_request(self):
-        message = self.client_sock.recv(BUFSIZE)
-        request = self.parse_request(message)
-        self.server_sock = self.connect_to_server(request.get_header("Host"))
-        self.server_sock.send(request.toRaw())
-        self.handle_response()
+        req = self.read_request()
+        print(req.toRaw())
 
-    def handle_response(self):
-        msg = self.server_sock.recv(BUFSIZE)
-        response = self.parse_response(msg)
-        content_length = response.get_header("Content-length")
 
-        #if not content_length:
-            #content_length = sys.maxint
-
-        #while len(data) != content_length and not data.endswith('\r\n\r\n'):
-            #msg = self.server_sock.recv(BUFSIZE)
-            #if not msg:
-                #break
-            #data += msg
-
-        self.client_sock.send(response.toRaw())
-
-    def recv_all(self, s):
-        total_data=[]
-        while True:
-            data = s.recv(BUFSIZE)
-            if not data: break
-            total_data.append(data)
-        return ''.join(total_data)
 
 class ProxyServer(object):
 
