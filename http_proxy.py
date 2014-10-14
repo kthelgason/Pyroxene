@@ -11,7 +11,7 @@ from time import strftime, gmtime
 LISTEN_ADDRESS = ''
 BUFSIZE = 8192
 SUPPORTED_METHODS = ['GET', 'POST', 'HEAD']
-SUPPORTED_VERSIONS = {'HTTP/1.1'}
+SUPPORTED_VERSIONS = ['HTTP/1.1']
 
 class LoggerException(Exception):
     pass
@@ -65,19 +65,63 @@ class Logger(object):
                 timestamp = strftime(self.timefmt, gmtime())
                 f.write(timestamp + self.logfmt % args)
 
+class HTTP_Message(object):
+    def __init__(self, start_line, headers, data):
+        # Class is abstract, should not be instantiated directly
+        pass
+
+    def parse_headers(self, header_lines):
+        headers = {}
+        for header in header_lines.split('\r\n'):
+            parts = header.split(':', 1)
+            key = parts[0]
+            value = parts[1].strip()
+            headers[key] = value
+        return headers
+
+    def get_header(self, key):
+        return self.headers.get(key)
+
+class Request(HTTP_Message):
+    def __init__(self, req_line, headers, data):
+        self.method, self.resource, self.protocol_version = req_line.split()
+        self.headers = self.parse_headers(headers)
+        self.data = data
+
+    def toRaw(self):
+        raw = ' '.join((self.method, self.resource, self.protocol_version))
+        raw += '\r\n'
+        for (key,value) in self.headers.iteritems():
+            raw += key + ": " + value + '\r\n'
+        raw += '\r\n'
+        raw += self.data
+        return raw
+
+
+class Response(HTTP_Message):
+    def __init__(self, resp_line, headers, data):
+        self.protocol_version, self.status, self.reason = resp_line.split(' ', 2)
+        self.headers = self.parse_headers(headers)
+        self.data = data
+
+    def toRaw(self):
+        raw = ' '.join((self.protocol_version, self.status, self.reason))
+        raw += '\r\n'
+        for (key,value) in self.headers.iteritems():
+            raw += key + ": " + value + '\r\n'
+        raw += '\r\n'
+        raw += self.data
+        return raw
+
 
 class ConnectionContext(object):
 
-    def __init__(self, client):
-        self.client_sock = client
+    def __init__(self, client_sock, client_addr):
+        self.client_sock = client_sock
+        self.client_addr = client_addr
         self.request_headers = {}
         self.response_headers = {}
-        message = self.client_sock.recv(BUFSIZE)
-        if message:
-            self.parse_request(message)
-            self.server_sock = self.connect_to_server(self.request_headers.get('host'))
-            self.server_sock.send(message)
-            self.proxy_loop()
+        self.proxy_request()
 
     def connect_to_server(self, host):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -98,31 +142,12 @@ class ConnectionContext(object):
 
     def parse_request(self, message):
         line, headers, data = self.split_message(message)
-        method, path, protocol_version = line.split()
-        if not method in SUPPORTED_METHODS:
-            self.send_unsupported_method_error()
-        self.request_headers = self.parse_headers(headers)
+        return Request(line, headers, data)
 
     def parse_response(self, message):
-        if not message:
-            return
         line, headers, data = self.split_message(message)
-        protocol_version, code, reason = line.split(' ', 2)
-        if not protocol_version in SUPPORTED_VERSIONS:
-            self.send_unsupported_version_error()
-        self.response_headers = self.parse_headers(headers)
-        #return len(line) + len(headers) + 6
-        return line, headers, data
+        return Response(line, headers, data)
 
-    def parse_headers(self, header_lines):
-        headers = {}
-        header_lines = header_lines.split('\r\n')
-        for header in header_lines:
-            parts = header.split(':')
-            key = parts[0].strip()
-            value = ':'.join(parts[1:]).strip()
-            headers[key.lower()] = value.lower()
-        return headers
 
     def send_unsupported_method_error(self):
         print("Unsupported Method!")
@@ -130,19 +155,28 @@ class ConnectionContext(object):
     def send_unsupported_version_error(self):
         print("Unsupported Protocol Version!")
 
-    def proxy_loop(self):
+    def proxy_request(self):
+        message = self.client_sock.recv(BUFSIZE)
+        request = self.parse_request(message)
+        self.server_sock = self.connect_to_server(request.get_header("Host"))
+        self.server_sock.send(request.toRaw())
+        self.handle_response()
+
+    def handle_response(self):
         msg = self.server_sock.recv(BUFSIZE)
-        line, headers, data = self.parse_response(msg)
-        content_length = sys.maxint
-        if "content-length" in self.response_headers:
-            content_length = int(self.response_headers.get("content-length"))
-        while len(data) != content_length and not data.endswith('\r\n\r\n'):
-            msg = self.server_sock.recv(BUFSIZE)
-            if not msg:
-                break
-            data += msg
-        packet = line + '\r\n' + headers + '\r\n\r\n' + data
-        self.client_sock.send(packet)
+        response = self.parse_response(msg)
+        content_length = response.get_header("Content-length")
+
+        #if not content_length:
+            #content_length = sys.maxint
+
+        #while len(data) != content_length and not data.endswith('\r\n\r\n'):
+            #msg = self.server_sock.recv(BUFSIZE)
+            #if not msg:
+                #break
+            #data += msg
+
+        self.client_sock.send(response.toRaw())
 
     def recv_all(self, s):
         total_data=[]
