@@ -11,7 +11,7 @@ from time import strftime, gmtime
 LISTEN_ADDRESS = ''
 BUFSIZE = 8192
 SUPPORTED_METHODS = ['GET', 'POST', 'HEAD']
-SUPPORTED_VERSIONS = ['HTTP/1.1']
+SUPPORTED_PROTOCOLS = ['HTTP/1.1']
 CRLF = '\r\n'
 
 class LoggerException(Exception):
@@ -66,6 +66,7 @@ class Logger(object):
                 timestamp = strftime(self.timefmt, gmtime())
                 f.write(timestamp + self.logfmt % args)
 
+
 class HTTP_Message(object):
     def __init__(self):
         # Class is abstract, should not be instantiated directly
@@ -90,6 +91,7 @@ class HTTP_Message(object):
             return data
         return None
 
+
 class Request(HTTP_Message):
     def __init__(self, f):
         self.method, self.resource, self.protocol_version = req_line.split()
@@ -107,13 +109,14 @@ class Request(HTTP_Message):
             raw += self.data
         return raw
 
+
 class HTTPMessageFactory(object):
     def __init__(self):
         pass
 
     def create_message(self, from_socket):
         headers = []
-        message_line = f.readline().split(" ", 2)
+        message_line = from_socket.readline().split(" ", 2)
         if message_line[0] in SUPPORTED_PROTOCOLS:
             type_ = "response"
         elif message_line[0] in SUPPORTED_METHODS:
@@ -122,10 +125,22 @@ class HTTPMessageFactory(object):
             pass
             # TODO: malformed request 400 error
 
-        data = f.readline()
-        while data != CRLF:
-            headers.append(data)
-            data = f.readline()
+        header = from_socket.readline()
+        while header != CRLF:
+            headers.append(header)
+            header = from_socket.readline()
+
+        length = self.get_header("Content-Length")
+        if length:
+            amt = int(length)
+            s = []
+            while length > 0:
+                chunk = from_socket.read(length)
+                if not chunk:
+                    break
+                s.append(chunk)
+                amt -= len(chunk)
+            payload = ''.join(s)
 
 
 
