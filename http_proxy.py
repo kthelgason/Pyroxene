@@ -5,14 +5,23 @@ import os
 import socket
 import argparse
 import threading
+import urlparse
 from time import strftime, gmtime
 
-
+PROXY_VERSION = "0.1"
+PROXY_NAME = "Pyroxene"
+VIA = PROXY_VERSION + " " + PROXY_NAME
 LISTEN_ADDRESS = ''
 BUFSIZE = 8192
-SUPPORTED_METHODS = ['GET', 'POST', 'HEAD']
+SUPPORTED_METHODS = ['GET', 'POST', 'HEAD', 'CONNECT']
 SUPPORTED_PROTOCOLS = ['HTTP/1.1']
 CRLF = '\r\n'
+
+CONNECTION_ESTABLISHED = CRLF.join([
+            'HTTP/1.1 200 Connection established',
+            'Proxy-agent: {}'.format(VIA),
+            CRLF
+        ])
 
 class LoggerException(Exception):
     pass
@@ -87,6 +96,12 @@ class HTTP_Message(object):
 class Request(HTTP_Message):
     def __init__(self, req_line, headers, data):
         self.method, self.resource, self.protocol_version = req_line
+        url = urlparse.urlsplit(self.resource)
+        if self.method == "CONNECT":
+            print("SECURE")
+            headers["Host"], self.port = url.path.split(":")
+        elif url:
+            headers["Host"], self.port = url.hostname, url.port if url.port else 80
         self.headers = headers
         self.data = data
 
@@ -114,8 +129,8 @@ class HTTPMessageFactory(object):
     def create_message(self, from_socket):
         f = from_socket.makefile('rb')
         headers = {}
-        message_line = f.readline().split(" ", 2)
-
+        message_line = f.readline()
+        message_line = message_line.split(" ", 2)
         if message_line == ['']:
             raise Exception
 
@@ -127,7 +142,6 @@ class HTTPMessageFactory(object):
             print(message_line[0])
             pass
             # TODO: malformed request 400 error
-
         header = f.readline()
         while header != CRLF:
             parts = header.split(':', 1)
@@ -135,7 +149,12 @@ class HTTPMessageFactory(object):
             value = parts[1].strip()
             headers[key] = value
             header = f.readline()
-
+        via = headers.get("Via")
+        if via:
+            via += ", " + VIA
+            headers["Via"] = via
+        else:
+            headers["Via"] = VIA
         length = headers.get("Content-Length")
         encoding = headers.get("Transfer-Encoding")
         payload = CRLF * 2
@@ -173,6 +192,7 @@ class HTTPMessageFactory(object):
 
         args = (message_line, headers, payload)
         f.close()
+
         return Request(*args) if type_ == "request" else Response(*args)
 
 
@@ -183,13 +203,14 @@ class ConnectionContext(object):
         self.client_sock = client_sock
         self.client_addr = client_addr
         self.server_sock = None
+        self.server_addr = None
         print("New connection from %s" % client_addr[0])
         self.proxy_request()
 
-    def connect_to_server(self, host):
+    def connect_to_server(self, host, port):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_addr = socket.gethostbyname(host)
-        sock.connect((self.server_addr, 80))
+        sock.connect((self.server_addr, port))
         self.server_sock = sock
 
     def send_unsupported_method_error(self):
@@ -208,7 +229,10 @@ class ConnectionContext(object):
         while True:
             try:
                 req = HTTPMessageFactory.create_message(self.client_sock)
-                self.connect_to_server(req.get_header("Host"))
+                #if req.method == "CONNECT":
+                #   self.tunnel(req)
+                #   continue
+                self.connect_to_server(req.get_header("Host"), int(req.port))
                 self.server_sock.send(req.toRaw())
                 resp = HTTPMessageFactory.create_message(self.server_sock)
                 connection = resp.get_header("Connection")
@@ -216,10 +240,21 @@ class ConnectionContext(object):
                 if connection and connection == "close":
                     break
             except Exception, e:
-                print("aw =( ")
+                print("aw =( {}".format(e))
                 break
-
         self.close_sockets()
+
+    def tunnel(self, req):
+        ## TODO after implementing polling
+        self.client_sock.send(CONNECTION_ESTABLISHED)
+        print(req.get_header("Host"))
+        self.connect_to_server(req.get_header("Host"), int(req.port))
+        while True:
+            chunk = self.client_sock.recv(4096)
+            if not chunk:
+                print("done")
+                break
+            self.client_sock.send(chunk)
 
 
 class ProxyServer(object):
