@@ -55,7 +55,7 @@ class Logger(object):
         return klass._instance
 
     def __init__(self):
-        self.logfmt = " : %s:%d %s %s : %d\n"
+        self.logfmt = " : %s:%d %s %s : %s\n"
         self.timefmt = "%Y-%m-%dT%H:%M:%S+0000"
         self.logfile = None
         self._file_lock = threading.Lock()
@@ -237,6 +237,11 @@ class ConnectionContext(object):
                 resp = HTTPMessageFactory.create_message(self.server_sock)
                 connection = resp.get_header("Connection")
                 self.client_sock.send(resp.toRaw())
+                Logger.instance().log(self.client_addr[0],
+                                      self.client_addr[1],
+                                      req.method,
+                                      req.resource,
+                                      resp.status)
                 if connection and connection == "close":
                     break
             except Exception, e:
@@ -250,7 +255,7 @@ class ConnectionContext(object):
         print(req.get_header("Host"))
         self.connect_to_server(req.get_header("Host"), int(req.port))
         while True:
-            chunk = self.client_sock.recv(4096)
+            chunk = self.client_sock.recv(BUFSIZE)
             if not chunk:
                 print("done")
                 break
