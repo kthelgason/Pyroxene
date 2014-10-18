@@ -162,6 +162,7 @@ class HTTPMessageFactory(object):
         length = headers.get("Content-Length")
         encoding = headers.get("Transfer-Encoding")
         payload = CRLF * 2
+        print(headers)
 
         if length:
             amount = int(length)
@@ -211,9 +212,9 @@ class ConnectionContext(object):
 
     def connect_to_server(self):
         host = self.packet.get_header("Host")
-        port = self.packet.port
         addr = socket.gethostbyname(host)
         if addr != self.server_addr:
+            port = self.packet.port
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((addr, port))
             sock.setblocking(0)
@@ -232,20 +233,22 @@ class ConnectionContext(object):
             self.server_sock.close()
         print("Closing connection.")
 
-    def recv(self, on_done):
+    def recv(self, on_done, on_disconnect):
         in_sock = self.server_sock if self.expecting_reply else self.client_sock
         try:
             data = in_sock.recv(BUFSIZE)
+            print(len(data))
             if not data:
                 print("No data")
+                on_disconnect(self)
                 return
             self.message_buffer += data
-            print(len(self.message_buffer))
             if self.message_buffer.endswith(CRLF*2):
                 print("Done reading")
                 self.packet = HTTPMessageFactory.packetFromBuffer(
                         self.message_buffer)
-                self.connect_to_server()
+                if self.packet.__class__ == Request:
+                    self.connect_to_server()
                 on_done(self)
         except socket.error as e:
             if e.args[0] != errno.EAGAIN:
@@ -261,10 +264,12 @@ class ConnectionContext(object):
             sent = out_sock.send(self.message_buffer)
             if sent == len(self.message_buffer):
                 print("Done sending")
+                close = self.packet.get_header("Connection")
                 self.expecting_reply = not self.expecting_reply
+                print("Expecting reply: ", self.expecting_reply)
                 self.message_buffer = b''
                 self.packet = None
-                on_done(self)
+                on_done(self, close)
             else:
                 self.message_buffer = self.message_buffer[sent:]
         except socket.error as e:
@@ -306,17 +311,14 @@ class ProxyServer(object):
 
     def register(self, conn):
         self.epoll.register(conn.client_sock.fileno(), select.EPOLLIN)
-        #self.epoll.register(conn.server_sock.fileno(), select.EPOLLOUT)
         self.connections[conn.client_sock.fileno()] = conn
-        #self.connections[conn.server_sock.fileno()] = conn
 
-    def unregister(self, fileno):
-        conn = self.connections[fileno]
-        del self.connections[conn.client_sock.fileno()]
-        del self.connections[conn.server_sock.fileno()]
-        self.epoll.unregister(conn.client_sock.fileno())
-        self.epoll.unregister(conn.server_sock.fileno())
-        conn.close_sockets()
+    def unregister(self, conn):
+        if not conn.expecting_reply:
+            print("Unregistering")
+            del self.connections[conn.client_sock.fileno()]
+            self.epoll.unregister(conn.client_sock.fileno())
+            conn.close_sockets()
 
     def accept_connection(self):
         client_sock, client_addr = self.sock.accept()
@@ -325,16 +327,23 @@ class ProxyServer(object):
         self.register(conn)
 
     def done_reading(self, conn):
-        self.epoll.register(conn.server_sock.fileno(), select.EPOLLOUT)
+        if conn.expecting_reply:
+            self.epoll.unregister(conn.server_sock.fileno())
+            self.epoll.register(conn.client_sock.fileno(), select.EPOLLOUT)
+        else:
+            self.epoll.unregister(conn.client_sock.fileno())
+            self.epoll.register(conn.server_sock.fileno(), select.EPOLLOUT)
+
         self.connections[conn.server_sock.fileno()] = conn
 
-    def done_sending(self, conn):
+    def done_sending(self, conn, close=None):
         if conn.expecting_reply:
-            self.epoll.modify(conn.client_sock.fileno(), select.EPOLLOUT)
             self.epoll.modify(conn.server_sock.fileno(), select.EPOLLIN)
         else:
-            self.epoll.modify(conn.server_sock.fileno(), select.EPOLLOUT)
-            self.epoll.modify(conn.client_sock.fileno(), select.EPOLLIN)
+            if close and close == "close":
+                self.unregister(conn)
+            else:
+                self.epoll.modify(conn.client_sock.fileno(), select.EPOLLIN)
 
     def start(self):
         try:
@@ -345,12 +354,13 @@ class ProxyServer(object):
                         print("new connection.")
                         self.accept_connection()
                     elif event & select.EPOLLIN:
-                        self.connections[fileno].recv(self.done_reading)
+                        print("read event")
+                        self.connections[fileno].recv(self.done_reading, self.unregister)
                     elif event & select.EPOLLOUT:
+                        print("write event")
                         self.connections[fileno].send(self.done_sending)
                     elif event & select.EPOLLHUP:
                         print("aaaaand HUP!")
-                        self.unregister(fileno)
         finally:
             self.epoll.unregister(self.sock.fileno())
             self.epoll.close()
