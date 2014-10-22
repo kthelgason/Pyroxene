@@ -17,7 +17,7 @@ PROXY_VERSION = "0.1"
 PROXY_NAME = "Pyroxene"
 VIA = PROXY_VERSION + " " + PROXY_NAME
 LISTEN_ADDRESS = ''
-BUFSIZE = 65536
+BUFSIZE = 2048
 SUPPORTED_METHODS = ['GET', 'POST', 'HEAD', 'CONNECT']
 SUPPORTED_PROTOCOLS = ['HTTP/1.1']
 CRLF = '\r\n'
@@ -211,8 +211,10 @@ class HTTPMessageParser(object):
         if length:
             if not self._data_remaining:
                 self._data_remaining = int(length)
+                print("reading data, length:", self._data_remaining)
             f, self._data_remaining = self.read_data_length(f, self._data_remaining)
             if self._data_remaining == 0:
+                print("done, payload length:", len(self._payload))
                 self._state = PARSER_STATE_DATA
         elif encoding and encoding == "chunked":
             f = self.parse_chunked_data(f)
@@ -227,7 +229,8 @@ class HTTPMessageParser(object):
 
     def parse_chunked_data(self, f):
         if self._data_remaining:
-            print(self._data_remaining)
+            print("Finish prev chunk with: ", self._data_remaining, "data remaining")
+            print("Payload size:", len(self._payload), "ends with: ", self._payload[-20:])
             f, self._data_remaining = self.read_data_length(f, self._data_remaining)
             if self._data_remaining == 0:
                 self._payload += f.readline()
@@ -236,13 +239,15 @@ class HTTPMessageParser(object):
             l = f.readline()
             if not l:
                 return f
-            self._payload += l + f.readline()
+            self._payload += l
             try:
                 chunk_length = int(l, 16)
                 print("chunk length: ", chunk_length)
             except Exception as e:
                 print(e)
             if chunk_length == 0:
+                print("All chunks done")
+                self._payload += CRLF
                 self._state = PARSER_STATE_DATA
                 return f
             f, self._data_remaining = self.read_data_length(f, chunk_length)
@@ -253,6 +258,7 @@ class HTTPMessageParser(object):
     def read_data_length(self, f, amount):
         chunk = f.read(amount)
         self._payload += chunk
+        print("read chunk, length:",len(chunk))
         return f, amount - len(chunk)
 
 
@@ -272,6 +278,7 @@ class AbstractConnection(object):
             packet = self.parser.try_parse(data)
             if packet:
                 on_done(self, packet)
+                self.message_buffer = b''
                 self.parser = HTTPMessageParser()
         except socket.error as e:
             if e.args[0] != errno.EAGAIN:
@@ -284,6 +291,7 @@ class AbstractConnection(object):
         except Empty as e:
             return
         if not self.message_buffer:
+            print("No buffer!")
             self.message_buffer = packet.toRaw()
         try:
             sent = self.sock.send(self.message_buffer)
@@ -305,7 +313,7 @@ class ClientConnection(AbstractConnection):
         self.addr = addr
         self.packet_state = 0
         self.message_buffer = b''
-        self.response_queue = Queue()
+        self.packet_queue = Queue()
         self.parser = HTTPMessageParser()
 
 
@@ -349,14 +357,6 @@ class ConnectionContext(object):
         else:
             return None
 
-    def close_socket_for_fileno(self, fileno):
-        if self.client_sock and self.client_sock.fileno() == fileno:
-            self.client_sock.close()
-            self.clinet_sock = None
-        elif self.server_sock and self.server_sock.fileno() == fileno:
-            self.server_sock.close()
-            self.server_sock = None
-
     def connect_to_server(self, on_disconnect, on_connect):
         host = self.packet.get_header("Host")
         addr = socket.gethostbyname(host)
@@ -392,7 +392,7 @@ class ConnectionContext(object):
             if not data:
                 # EOF
                 if not self.message_buffer:
-                    on_disconnect(self, fd)
+                    on_disconnect(self)
                     return
                 print("Connection closed while reading.")
 
@@ -468,7 +468,6 @@ class ProxyServer(object):
 
     def unregister(self, conn, fd):
         print("Unregistering ", fd)
-        conn.close_socket_for_fileno(fd)
         self.epoll.unregister(fd)
         # TODO: old servers?
 
@@ -484,20 +483,21 @@ class ProxyServer(object):
         return server
 
     def get_server_connection(self, conn, packet):
+        print("Getting peer for ", conn.sock.fileno())
         if packet.is_request():
             host = packet.get_header("Host")
             addr = socket.gethostbyname(host)
             sockfd = conn.server_connections.get(addr)
+            print(sockfd)
             if not sockfd:
                 return self.connect_to_server(addr, packet.port, conn)
 
+        print(conn.client_connection)
         return self.connections[conn.client_connection]
 
     def disconnect_from_server(self, conn):
-        if conn.sock:
-            conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 0)
-            self.epoll.modify(conn.sock.fileno(), 0)
-            conn.sock.shutdown(socket.SHUT_RDWR)
+        self.epoll.modify(conn.sock.fileno(), 0)
+        conn.sock.shutdown(socket.SHUT_RDWR)
 
     def accept_connection(self, fd):
         client_sock, client_addr = self.sock.accept()
@@ -506,14 +506,14 @@ class ProxyServer(object):
         self.register(conn, select.EPOLLIN)
 
     def on_read_callback(self, conn, packet):
-        print("Done reading")
+        print("Done reading from conn ", conn.sock.fileno())
         server = self.get_server_connection(conn, packet)
-        server.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 1)
         self.epoll.modify(server.sock.fileno(), select.EPOLLOUT)
         server.packet_queue.put(packet, False)
+        print("packet added to server queue, length:", len(packet.toRaw()))
 
     def on_send_callback(self, conn):
-        print("Done sending")
+        print("Done sending to ", conn.sock.fileno())
         self.epoll.modify(conn.sock.fileno(), select.EPOLLIN)
 
     def start(self):
@@ -527,7 +527,7 @@ class ProxyServer(object):
                     elif event & select.EPOLLIN:
                         print("Read event on ", fileno)
                         self.connections[fileno].recv(self.on_read_callback,
-                                                      self.unregister)
+                                                      self.disconnect_from_server)
                     elif event & select.EPOLLOUT:
                         print("Write event on ", fileno)
                         self.connections[fileno].send(fileno,
