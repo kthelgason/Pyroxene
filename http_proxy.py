@@ -177,7 +177,7 @@ class HTTPMessageParser(object):
         elif message_line[0] in SUPPORTED_METHODS:
             self._type = "request"
         else:
-            print(message_line[0])
+            print("AAAAAAA", message_line[0])
             pass
         self._message_line = message_line
         self._state = PARSER_STATE_LINE
@@ -207,7 +207,6 @@ class HTTPMessageParser(object):
         length = self._headers.get("Content-Length")
         encoding = self._headers.get("Transfer-Encoding")
         payload = b''
-
         if length:
             if not self._data_remaining:
                 self._data_remaining = int(length)
@@ -220,8 +219,12 @@ class HTTPMessageParser(object):
             f = self.parse_chunked_data(f)
         else:
             if self._type == "response":
+                print(self._message_line)
+                print(self._headers)
                 #TODO: send malformed response
                 print("aw =(")
+                if self._message_line[1] != 200:
+                    self._state = PARSER_STATE_DATA
             else:
                 print("parsing request")
                 self._state = PARSER_STATE_DATA
@@ -328,121 +331,6 @@ class ServerConnection(AbstractConnection):
         self.parser = HTTPMessageParser()
 
 
-class ConnectionContext(object):
-
-    def __init__(self, client_sock, client_addr):
-        self.client_sock     = client_sock
-        self.client_addr     = client_addr
-        self.server_sock     = None
-        self.server_addr     = None
-        self.expecting_reply = False
-        self.packet          = None
-        self.close           = False
-        self.message_buffer  = b''
-        self.factory         = HTTPMessageFactory()
-
-    def get_socket_for_fileno(self, fileno):
-        if self.client_sock and self.client_sock.fileno() == fileno:
-            return self.client_sock
-        elif self.server_sock and self.server_sock.fileno() == fileno:
-            return self.server_sock
-        else:
-            return None
-
-    def get_opposing_socket_for_fileno(self, fileno):
-        if self.client_sock and self.client_sock.fileno() == fileno:
-            return self.server_sock
-        elif self.server_sock and self.server_sock.fileno() == fileno:
-            return self.client_sock
-        else:
-            return None
-
-    def connect_to_server(self, on_disconnect, on_connect):
-        host = self.packet.get_header("Host")
-        addr = socket.gethostbyname(host)
-        if addr != self.server_addr:
-            if self.server_sock:
-                # An existing connection to another server must be terminated.
-                on_disconnect(self, self.server_sock.fileno())
-            port = self.packet.port
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            sock.connect((addr, port))
-            sock.setblocking(0)
-            self.server_addr = addr
-            self.server_sock = sock
-            on_connect(self, sock.fileno(), select.EPOLLOUT)
-
-    def send_unsupported_method_error(self):
-        print("Unsupported Method!")
-
-    def send_unsupported_version_error(self):
-        print("Unsupported Protocol Version!")
-
-    def close_sockets(self):
-        self.client_sock.close()
-        if self.server_sock:
-            self.server_sock.close()
-        print("Closing connection.")
-
-    def recv(self, fd, on_done, on_disconnect, on_connect):
-        in_sock = self.get_socket_for_fileno(fd)
-        try:
-            data = in_sock.recv(BUFSIZE)
-            if not data:
-                # EOF
-                if not self.message_buffer:
-                    on_disconnect(self)
-                    return
-                print("Connection closed while reading.")
-
-            if CRLF*2 in self.message_buffer:
-                self.packet = HTTPMessageFactory.packetFromBuffer(
-                        self.message_buffer)
-                if self.packet.__class__ == Request:
-                    self.connect_to_server(on_disconnect, on_connect)
-                out_sock = self.get_opposing_socket_for_fileno(fd)
-                on_done(self, out_sock.fileno())
-        except socket.error as e:
-            if e.args[0] != errno.EAGAIN:
-                raise e
-            print("Socket error! ", e)
-
-
-    def send(self, fd, on_done):
-        out_sock = self.get_socket_for_fileno(fd)
-        if not self.message_buffer:
-            return
-        try:
-            sent = out_sock.send(self.message_buffer)
-            if sent == len(self.message_buffer):
-                close = self.packet.get_header("Connection")
-                if close and close == 'close':
-                    self.close = True
-                self.expecting_reply = not self.expecting_reply
-                self.message_buffer = b''
-                self.packet = None
-                on_done(self, out_sock.fileno())
-            else:
-                self.message_buffer = self.message_buffer[sent:]
-        except socket.error as e:
-            if e.args[0] != errno.EAGAIN:
-                raise e
-            print("Socket error! ", e)
-
-    def tunnel(self, req):
-        ## TODO after implementing polling
-        self.client_sock.send(CONNECTION_ESTABLISHED)
-        print(req.get_header("Host"))
-        self.connect_to_server(req.get_header("Host"), int(req.port))
-        while True:
-            chunk = self.client_sock.recv(BUFSIZE)
-            if not chunk:
-                print("done")
-                break
-            self.client_sock.send(chunk)
-
-
 class ProxyServer(object):
 
     def __init__(self, port, ipv6=False):
@@ -491,6 +379,7 @@ class ProxyServer(object):
             print(sockfd)
             if not sockfd:
                 return self.connect_to_server(addr, packet.port, conn)
+            return self.connections[sockfd]
 
         print(conn.client_connection)
         return self.connections[conn.client_connection]
