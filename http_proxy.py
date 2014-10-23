@@ -33,8 +33,6 @@ PARSER_STATE_NONE, PARSER_STATE_LINE, PARSER_STATE_HEADERS, PARSER_STATE_DATA = 
 class LoggerException(Exception):
     pass
 
-class parseException(Exception):
-    pass
 
 class Logger(object):
     """
@@ -350,6 +348,12 @@ class Forwarder(object):
         self.client = ClientConnection(client_sock, client_addr)
         self.servers = {}
 
+    def get_connection_for_fileno(fd):
+        if self.client.sock.fileno() == fd:
+            return self.client
+        else:
+            return self.servers[fd]
+
 
 class ProxyServer(object):
 
@@ -408,11 +412,12 @@ class ProxyServer(object):
         self.epoll.modify(conn.sock.fileno(), 0)
         conn.sock.shutdown(socket.SHUT_RDWR)
 
-    def accept_connection(self, fd):
+    def accept_connection(self):
         client_sock, client_addr = self.sock.accept()
         client_sock.setblocking(0)
+        self.epoll.register(client_sock.fileno(), select.EPOLLIN)
         proxy = Forwarder(client_sock, client_addr)
-        self.register(proxy, select.EPOLLIN)
+        self.connections[client_sock.fileno()] = proxy
 
     def on_read_callback(self, conn, packet):
         print("Done reading from conn ", conn.sock.fileno())
@@ -432,7 +437,7 @@ class ProxyServer(object):
                 for fileno, event in events:
                     if fileno == self.sock.fileno():
                         print("new connection")
-                        self.accept_connection(fileno)
+                        self.accept_connection()
                     elif event & select.EPOLLIN:
                         print("Read event on ", fileno)
                         self.connections[fileno].recv(self.on_read_callback,
