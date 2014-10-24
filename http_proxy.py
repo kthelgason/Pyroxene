@@ -6,6 +6,7 @@ import errno
 import binascii
 import socket
 import select
+import signal
 import argparse
 import threading
 import urlparse
@@ -221,7 +222,11 @@ class HTTPMessageParser(object):
 
     def parse_message_data(self, f):
         length = self._headers.get("Content-Length")
+        if not length:
+            length = self._headers.get("content-cength")
         encoding = self._headers.get("Transfer-Encoding")
+        if not encoding:
+            encoding = self._headers.get("transfer-encoding")
         payload = b''
         if length:
             if not self._data_remaining:
@@ -234,7 +239,6 @@ class HTTPMessageParser(object):
         else:
             if self._type == "response":
                 #TODO: send malformed response
-                print("aw =(")
                 if self._message_line[1] != 200:
                     self._state = PARSER_STATE_DATA
             else:
@@ -253,6 +257,11 @@ class HTTPMessageParser(object):
             if not l:
                 return f
             self._payload += l
+            while l == CRLF or l == '':
+                l = f.readline()
+                if not l:
+                    return f
+                self._payload += l
             try:
                 chunk_length = int(l, 16)
             except Exception as e:
@@ -298,9 +307,6 @@ class HTTPConnection(object):
 
     def recv(self):
         """
-        Takes two callbacks as parameters.
-        `on_done` is called when the read event is finished.
-        `on_disconnect` is called if the remote end hangs up,
         and is responsible for shutting down the connection cleanly.
         The return type signals the proxyContext wether we recieved a
         whole packet or whether this socket should be read again.
@@ -392,9 +398,8 @@ class ProxyContext(object):
     def get_host_by_name(self, host):
         """
         This may be the most hacktastic piece of shit ever
-        It't incredible that there exists no better way...
+        It's incredible that there exists no better way...
         """
-        import signal
         name = ""
         def handler(signum, frame):
             raise Exception("timed out!")
@@ -433,19 +438,28 @@ class ProxyContext(object):
             self.on_recv(server.sock.fileno())
         else:
             self.client.enqueue(packet)
+            print(packet.headers)
             self.on_recv(self.client.sock.fileno())
 
-    def close_connection(self):
-        self.on_disc(self.client.sock.fileno())
-        self.client.disconnect()
+    def close(self, conn):
+        print("Closing ", conn.sock.fileno())
+        self.on_disc(conn.sock.fileno())
+        conn.disconnect()
+        self.servers = {key: value for key, value in self.servers.items()
+                if value != conn}
+
+    def close_all(self):
+        self.close(self.client)
         # Loop through servers and disconnect them as well
         for (key, server) in self.servers.items():
             if type(key) == int:
-                self.on_disc(key)
-                server.disconnect()
+                self.close(server)
 
     def recv(self, fd):
         print("State: ", self.state)
+        for (key, server) in self.servers.items():
+            print("Server: ", server.sock.fileno())
+        print("Client: ", self.client.sock.fileno())
         if self.state == ConnState.ready:
             try:
                 packet = self.client.recv()
@@ -454,16 +468,31 @@ class ProxyContext(object):
                     self.handle_packet(packet, "request")
             except EmptySocketException as e:
                 # Recieved EOF from client socket.
-                self.close_connection()
+                self.close_all()
         elif self.state == ConnState.req_sent:
             server = self.servers[fd]
-            packet = server.recv()
+            try:
+                packet = server.recv()
+            except EmptySocketException as e:
+                # EOF from server
+                self.close(server)
+                print("Empty server socket")
+                return
             if packet:
                 self.state = ConnState.resp_recv
                 self.handle_packet(packet, "response")
         elif self.state == ConnState.close:
             pass
             #TODO: Do something sensible
+        else:
+            try:
+                packet = server.recv()
+            except EmptySocketException as e:
+                # EOF from server
+                self.close(server)
+                print("Empty server socket")
+                return
+
 
     def send(self, fd):
         print("State: ", self.state)
@@ -477,6 +506,14 @@ class ProxyContext(object):
         else:
             print("I haz no idea")
         self.on_send(fd)
+
+    def cleanup(self, fd):
+        print("Closing connection ", fd)
+        server = self.servers.get(fd)
+        if server:
+            server.sock.close()
+        else:
+            self.client.sock.close()
 
 
 class ProxyServer(object):
@@ -499,18 +536,22 @@ class ProxyServer(object):
         return sock
 
     def register(self, conn, fd, type_):
+        print("Registering ", fd)
         self.epoll.register(fd, type_)
         self.connections[fd] = conn
 
-    def unregister(self, conn, fd):
+    def unregister(self, conn):
+        print("Unregistering ", fd)
+        fd = conn.sock.fileno()
+        conn.sock.close()
+        conn.sock = None
+        del self.connections[fd]
+        self.epoll.unregister(fd)
+
+    def on_disconnect_callback(self, fd):
         print("Unregistering ", fd)
         del self.connections[fd]
         self.epoll.unregister(fd)
-        # TODO: old servers?
-
-    def on_disconnect_callback(self, fd):
-        self.epoll.modify(fd, 0)
-        #conn.sock.shutdown(socket.SHUT_RDWR)
 
     def accept_connection(self, fd):
         client_sock, client_addr = self.sock.accept()
@@ -532,20 +573,24 @@ class ProxyServer(object):
         try:
             while True:
                 events = self.epoll.poll(1)
+                print(events)
                 for fileno, event in events:
-                    if fileno == self.sock.fileno():
-                        print("new connection")
-                        self.accept_connection(fileno)
-                    elif event & select.EPOLLIN:
-                        print("Read event on ", fileno)
-                        self.connections[fileno].recv(fileno)
-                    elif event & select.EPOLLOUT:
-                        print("Write event on ", fileno)
-                        self.connections[fileno].send(fileno)
-                    elif event & (select.EPOLLHUP
-                                | select.EPOLLERR):
-                        print("aaaaand HUP!")
-                        self.unregister(self.connections[fileno], fileno)
+                    try:
+                        if fileno == self.sock.fileno():
+                            print("new connection")
+                            self.accept_connection(fileno)
+                        elif event & select.EPOLLIN:
+                            print("Read event on ", fileno)
+                            self.connections[fileno].recv(fileno)
+                        elif event & select.EPOLLOUT:
+                            print("Write event on ", fileno)
+                            self.connections[fileno].send(fileno)
+                        elif event & (select.EPOLLHUP
+                                    | select.EPOLLERR):
+                            print("aaaaand HUP!")
+                            self.connections[fileno].cleanup(fileno)
+                    except KeyError:
+                        continue
         finally:
             self.epoll.unregister(self.sock.fileno())
             self.epoll.close()
