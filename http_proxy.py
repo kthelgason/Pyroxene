@@ -416,7 +416,9 @@ class HTTPConnection(object):
         # Non-blocking sockets throw exceptions if they would block
         # we ignore those errors and try again.
         except socket.error as e:
-            if e.args[0] != errno.EAGAIN:
+	    if e.args[0] == errno.ECONNRESET:
+		raise EmptySocketException("reset")
+            elif e.args[0] != (errno.EAGAIN | errno.EBADF):
                 raise e
 
     def send(self):
@@ -535,8 +537,9 @@ class ProxyContext(object):
             self.on_recv(self.client.sock.fileno())
 
     def close(self, conn):
-        self.on_disc(conn.sock.fileno(), conn.disconnect())
-        self.servers = {key: value for key, value in self.servers.items()
+	if conn.packet_queue._qsize() == 0:
+            self.on_disc(conn.sock.fileno(), conn.disconnect())
+            self.servers = {key: value for key, value in self.servers.items()
                 if value != conn}
 
     def close_all(self):
@@ -548,23 +551,32 @@ class ProxyContext(object):
             if type(key) == int:
                 self.close(server)
 
+    def get_host(self, fd):
+	try:
+	    if fd == self.client.sock.fileno():
+                return self.client
+            else:
+                return self.servers[fd]
+	except Exception:
+	    pass
+
     def recv(self, fd):
-        if fd == self.client.sock.fileno():
-            host = self.client
-        else:
-            host = self.servers[fd]
+	host = self.get_host(fd)
+	if not host:
+	    return
         try:
             packet = host.recv()
             if packet:
                 if packet.get_header("Connection") == "close":
                     self.close_connection = True
                 self.handle_packet(packet, host.log_message)
+		if self.close_connection and host != self.client:
+		    # Close the server that sent Connection: close
+		    self.close(host)
         except EmptySocketException as e:
             # Recieved EOF from socket
             if host == self.client:
                 self.close_all()
-            elif self.close_connection and len(self.servers) == 0:
-                self.close(self.client)
             else:
                 self.close(host)
         except MalformedRequestException as e:
@@ -573,16 +585,15 @@ class ProxyContext(object):
             self.on_recv(self.client.sock.fileno())
 
     def send(self, fd):
-        if fd == self.client.sock.fileno():
-            host = self.client
-        else:
-            host = self.servers[fd]
+	host = self.get_host(fd)
         if host.send():
             self.on_send(fd)
         if host == self.client and self.close_connection:
-            if len(self.servers) <= 2:
-                print("closing all")
-                self.close_all()
+	    # If the connection should be closed and we have no pending
+            # server connections, close the client
+	    print("server length", len(self.servers))
+	    if len(self.servers) == 0:
+	        self.close(host)
 
 
 class ProxyServer(object):
@@ -609,10 +620,10 @@ class ProxyServer(object):
         self.connections[fd] = conn
 
     def unregister(self, conn, fd):
-        host = conn.servers.get(fd)
-        if not host:
-            host = conn.client
+	print("unregister", fd)
+	host = conn.get_host(fd)
         host.sock.close()
+	host = None
         del self.connections[fd]
         self.epoll.unregister(fd)
 
