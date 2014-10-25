@@ -563,6 +563,8 @@ class ProxyContext(object):
             # Recieved EOF from socket
             if host == self.client:
                 self.close_all()
+            elif self.close_connection and len(self.servers) == 0:
+                self.close(self.client)
             else:
                 self.close(host)
         except MalformedRequestException as e:
