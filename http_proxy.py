@@ -6,6 +6,9 @@ An event-driven proxy server.
 
 license: 2-Clause BSD License.
 
+The server listens for incoming connections on it's port, given in
+a command-line argument, and spawns
+
 """
 from __future__ import print_function, with_statement
 
@@ -141,6 +144,7 @@ class Request(HTTP_Message):
     def __init__(self, req_line, headers, data):
         super(Request, self).__init__(headers, data)
         self.method, self.resource, self.protocol_version = req_line
+        # keep track of the aboslute path, before rewriting.
         self.abs_resource = self.resource
         # Rewrite the resource string
         url = urlparse.urlsplit(self.resource)
@@ -212,6 +216,7 @@ class HTTPMessageParser(object):
         The packet is implemented as a state-machine keeping track
         of how much of the message we have recieved thusfar.
         """
+        # Create a file object from the buffer
         f = cStringIO.StringIO(buffer_)
         try:
             if self._state == PARSER_STATE_NONE:
@@ -224,17 +229,21 @@ class HTTPMessageParser(object):
                 return self.create_packet()
             return None
         except Exception as e:
+            # TODO: ?????
             raise e
 
     def create_packet(self):
+        """ Create a packet """
         args = (self._message_line, self._headers, self._payload)
         return Request(*args) if self._type == "request" else Response(*args)
 
-
     def parse_message_line(self, f):
         self._message_line += f.readline()
+        # Handle empty line at start of packet
         if self._message_line == CRLF:
             self._message_line += f.readline()
+        # Some message lines are so long that we don't get the whole thing
+        # in one recv call
         if not self._message_line or not self._message_line.endswith(CRLF):
             return f
         message_line = self._message_line.split(" ", 2)
@@ -247,11 +256,13 @@ class HTTPMessageParser(object):
         else:
             return f
         self._message_line = message_line
+        # Transition state once the message-line is read and approved
         self._state = PARSER_STATE_LINE
         return f
 
     def parse_message_headers(self, f):
         header = f.readline()
+        # Possible empty line at start of headers
         if header == CRLF:
             header = f.readline()
         while header != CRLF:
@@ -260,21 +271,28 @@ class HTTPMessageParser(object):
             value = parts[1].strip() if len(parts) == 2 else ''
             self._headers[key] = value
             header = f.readline()
+            # Empty line in middle of headers indicates we have yet
+            # to recieve more.
             if not header:
                 return f
+        # Add via header
         via = self._headers.get("Via")
         if via:
             via += ", " + VIA
             self._headers["Via"] = via
         else:
             self._headers["Via"] = VIA
+        # Transition state
         self._state = PARSER_STATE_HEADERS
         return f
 
     def parse_message_data(self, f):
+        # check for content-length or chunked data.
+        # we need to check for both upper and lower case strings
+        # as some servers for some reason send headers in uncapitalized.
         length = self._headers.get("Content-Length")
         if not length:
-            length = self._headers.get("content-cength")
+            length = self._headers.get("content-length")
         encoding = self._headers.get("Transfer-Encoding")
         if not encoding:
             encoding = self._headers.get("transfer-encoding")
@@ -288,12 +306,8 @@ class HTTPMessageParser(object):
         elif encoding and encoding == "chunked":
             f = self.parse_chunked_data(f)
         else:
-            if self._type == "response":
-                #TODO: send malformed response
-                if self._message_line[1] != 200:
-                    self._state = PARSER_STATE_DATA
-            else:
-                self._state = PARSER_STATE_DATA
+            # assume no data if neither content-length or encoding is present.
+            self._state = PARSER_STATE_DATA
         return f
 
     def parse_chunked_data(self, f):
@@ -326,6 +340,7 @@ class HTTPMessageParser(object):
                 self._data_remaining = None
 
     def read_data_length(self, f, amount):
+        """ Reads a chunk of data, and returns the amount read """
         chunk = f.read(amount)
         self._payload += chunk
         return f, amount - len(chunk)
@@ -348,6 +363,11 @@ class HTTPConnection(object):
         self.parser = HTTPMessageParser()
 
     def disconnect(self):
+        """
+        Attempt to disconnect this connection.
+        Returns True if it has disconnected previously.
+        This can occur if the remote terminates the connection.
+        """
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
             return False
@@ -383,7 +403,6 @@ class HTTPConnection(object):
             packet = self.parser.try_parse(data)
 
             if packet:
-                #on_done(self, packet)
                 # Reset connection state to get ready for next read.
                 self.message_buffer = b''
                 self.parser = HTTPMessageParser()
@@ -418,6 +437,8 @@ class HTTPConnection(object):
             else:
                 self.message_buffer = self.message_buffer[sent:]
                 return False
+        # Non-blocking sockets throw exceptions if they would block
+        # we ignore those errors and try again.
         except socket.error as e:
             if e.args[0] != errno.EAGAIN:
                 raise e
