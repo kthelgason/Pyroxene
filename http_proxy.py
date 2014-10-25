@@ -117,6 +117,7 @@ class Request(HTTP_Message):
     def __init__(self, req_line, headers, data):
         super(Request, self).__init__(headers, data)
         self.method, self.resource, self.protocol_version = req_line
+        self.abs_resource = self.resource
         url = urlparse.urlsplit(self.resource)
         path = url.path
         if path == '':
@@ -294,6 +295,7 @@ class HTTPConnection(object):
     def __init__(self, sock, addr):
         self.sock = sock
         self.addr = addr
+        self.log_message = None
         self.message_buffer = b''
         self.packet_queue = Queue()
         self.parser = HTTPMessageParser()
@@ -373,10 +375,6 @@ class HTTPConnection(object):
             print("Socket error! ", e)
 
 
-class ConnState:
-    """ Dummy class to represent a state enum """
-    ready, req_recv, req_sent, resp_recv, resp_sent, close  = range(6)
-
 class ProxyContext(object):
     """
     Keeps track of the relationship between a client and one or more servers.
@@ -392,7 +390,6 @@ class ProxyContext(object):
                 ):
         self.client = HTTPConnection(sock, addr)
         self.servers = {}
-        self.state = ConnState.ready
         self.register = register_callback
         self.on_recv = recv_callback
         self.on_send = send_callback
@@ -441,7 +438,7 @@ class ProxyContext(object):
             self.servers[host] = server
             self.register(self, sock.fileno(), select.EPOLLOUT)
 
-    def handle_packet(self, packet):
+    def handle_packet(self, packet, sender):
         print("Handling packet for: ", packet.get_header("Host"))
         if packet.__class__ == Request:
             server = self.servers.get(packet.get_header("Host"))
@@ -449,10 +446,15 @@ class ProxyContext(object):
                 self.connect_to_server(packet)
                 server = self.servers[packet.get_header("Host")]
             server.enqueue(packet)
+            server.log_message = (packet.method, packet.abs_resource)
             self.on_recv(server.sock.fileno())
         else:
+            Logger.instance().log(self.client.addr[0], self.client.addr[1],
+                                  sender.log_message[0],
+                                  sender.log_message[1],
+                                  packet.status
+                                 )
             self.client.enqueue(packet)
-            print(packet.headers)
             self.on_recv(self.client.sock.fileno())
 
     def close(self, conn):
@@ -479,7 +481,7 @@ class ProxyContext(object):
         try:
             packet = host.recv()
             if packet:
-                self.handle_packet(packet)
+                self.handle_packet(packet, host)
         except EmptySocketException as e:
             # Recieved EOF from socket
             if host == self.client:
