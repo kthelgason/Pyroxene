@@ -27,7 +27,7 @@ VIA = PROXY_VERSION + " " + PROXY_NAME
 LISTEN_ADDRESS = ''
 BUFSIZE = 65536
 SUPPORTED_METHODS = ['GET', 'POST', 'HEAD']
-SUPPORTED_PROTOCOLS = ['HTTP/1.0', 'HTTP/1.1']
+SUPPORTED_PROTOCOLS = ['HTTP/1.1', 'HTTP/1.0']
 CRLF = '\r\n'
 
 CONNECTION_ESTABLISHED = CRLF.join([
@@ -142,7 +142,6 @@ class Request(HTTP_Message):
         super(Request, self).__init__(headers, data)
         self.method, self.resource, self.protocol_version = req_line
         self.abs_resource = self.resource
-        # Rewrite the resource string
         url = urlparse.urlsplit(self.resource)
         path = url.path
         if path == '':
@@ -168,7 +167,6 @@ class Request(HTTP_Message):
 
 
 class Response(HTTP_Message):
-    """ Simple representation of a HTTP Response """
     def __init__(self, resp_line, headers, data):
         self.protocol_version, self.status, self.reason = resp_line
         self.headers = headers
@@ -254,11 +252,13 @@ class HTTPMessageParser(object):
         header = f.readline()
         if header == CRLF:
             header = f.readline()
-        while header != CRLF:
+        while header and header != CRLF:
             parts = header.split(':', 1)
             key = parts[0]
             value = parts[1].strip() if len(parts) == 2 else ''
             self._headers[key] = value
+            if key == "Connection" and value == "close":
+                print("Got connection: close")
             header = f.readline()
             if not header:
                 return f
@@ -318,6 +318,10 @@ class HTTPMessageParser(object):
                 print(e)
             if chunk_length == 0:
                 self._payload += CRLF
+                if len(self._payload[:16]) < 16:
+                    print("First chunk has length 0, so we close")
+                    #First chunk has length 0
+                    self._headers["Connection"] = "close"
                 self._state = PARSER_STATE_DATA
                 return f
             f, self._data_remaining = self.read_data_length(f, chunk_length)
@@ -346,6 +350,7 @@ class HTTPConnection(object):
         self.message_buffer = b''
         self.packet_queue = Queue()
         self.parser = HTTPMessageParser()
+        self.close = False
 
     def disconnect(self):
         try:
@@ -442,6 +447,7 @@ class ProxyContext(object):
         self.on_recv = recv_callback
         self.on_send = send_callback
         self.on_disc = disconnect_callback
+        self.close_connection = False
 
     def get_host_by_name(self, host):
         """
@@ -529,6 +535,8 @@ class ProxyContext(object):
         try:
             packet = host.recv()
             if packet:
+                if packet.get_header("Connection") == "close":
+                    self.close_connection = True
                 self.handle_packet(packet, host.log_message)
         except EmptySocketException as e:
             # Recieved EOF from socket
@@ -548,6 +556,9 @@ class ProxyContext(object):
             host = self.servers[fd]
         if host.send():
             self.on_send(fd)
+        if host == self.client and self.close_connection:
+            print("Connection: close, closing all")
+            self.close_all()
 
 
 class ProxyServer(object):
@@ -595,7 +606,7 @@ class ProxyServer(object):
         self.register(conn, client_sock.fileno(), select.EPOLLIN)
 
     def on_read_callback(self, fd):
-        self.epoll.modify(fd, select.EPOLLOUT)
+        self.epoll.modify(fd, select.EPOLLOUT | select.EPOLLIN)
 
     def on_send_callback(self, fd):
         self.epoll.modify(fd, select.EPOLLIN)
@@ -612,8 +623,7 @@ class ProxyServer(object):
                             self.connections[fileno].recv(fileno)
                         elif event & select.EPOLLOUT:
                             self.connections[fileno].send(fileno)
-                        elif event & (select.EPOLLHUP
-                                    | select.EPOLLERR):
+                        elif event & (select.EPOLLHUP | select.EPOLLERR):
                             self.unregister(self.connections[fileno], fileno)
                     except KeyError:
                         continue
