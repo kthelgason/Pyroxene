@@ -578,8 +578,9 @@ class ProxyContext(object):
         if host.send():
             self.on_send(fd)
         if host == self.client and self.close_connection:
-            print("Connection: close, closing all")
-            self.close_all()
+            if len(self.servers) <= 2:
+                print("closing all")
+                self.close_all()
 
 
 class ProxyServer(object):
