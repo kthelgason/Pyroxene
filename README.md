@@ -27,7 +27,7 @@
               .d8X8Xbd8X8X8X8X8XbdX8X8b.
           _.-dX8X8Xbd8X8X8X8X8X8XdbX8X8Xb-._
        .-d8X8X8X8bdX8X8X8X8X8X8X8X8db8X8X8X8b-.
-    .-d8X8X8X8X8bdX8X8X8X8X8X8X8X8X8db8X8X8-RG-b-.
+    .-d8X8X8X8X8bdX8X8X8X8X8X8X8X8X8db8X8X8X8X8b-.
 
 
 Pyroxene is a light-weight HTTP proxy server written in python.
