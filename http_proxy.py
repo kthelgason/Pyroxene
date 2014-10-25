@@ -180,7 +180,8 @@ class HTTPMessageParser(object):
             print(e)
 
     def create_packet(self):
-        print("creating packet")
+        print("creating packet with content size ", len(self._payload))
+        print("content-length was ", self._headers.get("Content-Length"))
         args = (self._message_line, self._headers, self._payload)
         return Request(*args) if self._type == "request" else Response(*args)
 
@@ -195,8 +196,7 @@ class HTTPMessageParser(object):
         elif message_line[0] in SUPPORTED_METHODS:
             self._type = "request"
         else:
-            print("AAAAAAA", message_line[0])
-            pass
+            return f
         self._message_line = message_line
         self._state = PARSER_STATE_LINE
         return f
@@ -205,12 +205,14 @@ class HTTPMessageParser(object):
         header = f.readline()
         if header == CRLF:
             header = f.readline()
-        while header and header != CRLF:
+        while header != CRLF:
             parts = header.split(':', 1)
             key = parts[0]
             value = parts[1].strip() if len(parts) == 2 else ''
             self._headers[key] = value
             header = f.readline()
+            if not header:
+                return
         via = self._headers.get("Via")
         if via:
             via += ", " + VIA
@@ -347,22 +349,23 @@ class HTTPConnection(object):
         is too big to send all at once. Returns true or false depending
         on wether send was successful.
         """
-        try:
-            packet = self.packet_queue.get(False)
-        except Empty as e:
-            return
-
         # If there is not a buffer waiting to be sent,
         # fill it with the next packet in the queue.
         if not self.message_buffer:
+            try:
+                packet = self.packet_queue.get(False)
+            except Empty as e:
+                return True
             self.message_buffer = packet.toRaw()
         try:
             sent = self.sock.send(self.message_buffer)
             if sent == len(self.message_buffer):
+                print(len(self.message_buffer))
                 self.message_buffer = b''
                 return True
             else:
                 self.message_buffer = self.message_buffer[sent:]
+                print(len(self.message_buffer))
                 return False
         except socket.error as e:
             if e.args[0] != errno.EAGAIN:
@@ -397,17 +400,23 @@ class ProxyContext(object):
 
     def get_host_by_name(self, host):
         """
-        This may be the most hacktastic piece of shit ever
-        It's incredible that there exists no better way...
+        A function that wraps gethostbyname with a timeout
+        as the function is provided by the kernel and by
+        default blocks everything for 30 secs if the host
+        is invalid.
         """
         name = ""
+        # Signal handler raises error
         def handler(signum, frame):
             raise Exception("timed out!")
         signal.signal(signal.SIGALRM, handler)
+        # send SIGALRM to ourselves in 1 sec.
         signal.alarm(1)
         try:
             name = socket.gethostbyname(host)
+            # If gethostbyname succeeds we unregister the signal handler.
             signal.signal(signal.SIGALRM, signal.SIG_IGN)
+        # Catch exception thrown by signal handler if timout has expired.
         except Exception as e:
             print("Gethost timed out!")
             #TODO: handle
@@ -417,7 +426,12 @@ class ProxyContext(object):
         host = packet.get_header("Host")
         print("Connecting to %s for %d" % (host, self.client.sock.fileno()))
         addr = self.get_host_by_name(host)
+        if not addr:
+            #TODO: send 404
+            return
         port = packet.port
+        # If we do not already have an open connection to this server
+        # we go ahead and create it.
         if host not in self.servers.keys():
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((addr, port))
@@ -427,9 +441,9 @@ class ProxyContext(object):
             self.servers[host] = server
             self.register(self, sock.fileno(), select.EPOLLOUT)
 
-    def handle_packet(self, packet, type_):
+    def handle_packet(self, packet):
         print("Handling packet for: ", packet.get_header("Host"))
-        if type_ == "request":
+        if packet.__class__ == Request:
             server = self.servers.get(packet.get_header("Host"))
             if not server:
                 self.connect_to_server(packet)
@@ -450,62 +464,37 @@ class ProxyContext(object):
 
     def close_all(self):
         self.close(self.client)
-        # Loop through servers and disconnect them as well
+        # Iterate over servers and disconnect them as well
         for (key, server) in self.servers.items():
+            # this check is nessecary as each server appears twice in the
+            # dictionary, once keyed on the FD and once on the hostname.
             if type(key) == int:
                 self.close(server)
 
     def recv(self, fd):
-        print("State: ", self.state)
-        for (key, server) in self.servers.items():
-            print("Server: ", server.sock.fileno())
-        print("Client: ", self.client.sock.fileno())
-        if self.state == ConnState.ready:
-            try:
-                packet = self.client.recv()
-                if packet:
-                    self.state = ConnState.req_recv
-                    self.handle_packet(packet, "request")
-            except EmptySocketException as e:
-                # Recieved EOF from client socket.
-                self.close_all()
-        elif self.state == ConnState.req_sent:
-            server = self.servers[fd]
-            try:
-                packet = server.recv()
-            except EmptySocketException as e:
-                # EOF from server
-                self.close(server)
-                print("Empty server socket")
-                return
-            if packet:
-                self.state = ConnState.resp_recv
-                self.handle_packet(packet, "response")
-        elif self.state == ConnState.close:
-            pass
-            #TODO: Do something sensible
+        if fd == self.client.sock.fileno():
+            host = self.client
         else:
-            try:
-                packet = server.recv()
-            except EmptySocketException as e:
-                # EOF from server
-                self.close(server)
-                print("Empty server socket")
-                return
+            host = self.servers[fd]
+        try:
+            packet = host.recv()
+            if packet:
+                self.handle_packet(packet)
+        except EmptySocketException as e:
+            # Recieved EOF from socket
+            if host == self.client:
+                self.close_all()
+            else:
+                self.close(host)
 
 
     def send(self, fd):
-        print("State: ", self.state)
-        if self.state == ConnState.req_recv:
-            server = self.servers[fd]
-            if server.send():
-                self.state = ConnState.req_sent
-        elif self.state == ConnState.resp_recv:
-            if self.client.send():
-                self.state = ConnState.ready
+        if fd == self.client.sock.fileno():
+            host = self.client
         else:
-            print("I haz no idea")
-        self.on_send(fd)
+            host = self.servers[fd]
+        if host.send():
+            self.on_send(fd)
 
     def cleanup(self, fd):
         print("Closing connection ", fd)
@@ -573,7 +562,6 @@ class ProxyServer(object):
         try:
             while True:
                 events = self.epoll.poll(1)
-                print(events)
                 for fileno, event in events:
                     try:
                         if fileno == self.sock.fileno():
@@ -599,7 +587,7 @@ class ProxyServer(object):
 
 def main():
     parser = argparse.ArgumentParser(
-            description="A command-line http proxy server.")
+            description="A full-featured http proxy server.")
     parser.add_argument('port', type=int, help="The port to start the server on")
     parser.add_argument('logfile', help='The logfile to log connections to')
     parser.add_argument('--ipv6', action="store_true", help="Use IPv6")
