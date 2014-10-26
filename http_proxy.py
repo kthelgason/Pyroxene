@@ -274,10 +274,8 @@ class HTTPMessageParser(object):
         elif message_line[0] in SUPPORTED_METHODS:
             self._type = "request"
         elif "HTTP" in message_line[0]:
-            print("HTTP Version Not Supported")
             raise HTTPVersionNotSupportedException()
         else:
-            print("Not Implemented: ", message_line[0])
             raise NotImplementedException()
         self._message_line = message_line
         # Transition state once the message-line is read and approved
@@ -444,6 +442,10 @@ class HTTPConnection(object):
                 raise EmptySocketException("reset")
             elif e.args[0] != (errno.EAGAIN | errno.EBADF):
                 raise e
+        except (HTTPVersionNotSupportedException, NotImplementedException) as e:
+            self.message_buffer = b''
+            self.parser = HTTPMessageParser()
+            raise e
 
     def send(self):
         """
