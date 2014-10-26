@@ -212,6 +212,18 @@ class HTTPMessageParser(object):
                 {"Content-Length" : "0", "Connection" : "close", "Server": VIA},
                 "")
 
+    @classmethod
+    def not_implemented_packet(klass):
+        return Response(["HTTP/1.1", "501", "Not Implemented\r\n"],
+                {"Content-Length" : "0", "Connection" : "close", "Server": VIA},
+                "")
+
+    @classmethod
+    def HTTP_version_not_supported_packet(klass):
+        return Response(["HTTP/1.1", "505", "HTTP Version Not Supported\r\n"],
+                {"Content-Length" : "0", "Connection" : "close", "Server": VIA},
+                "")
+
     def try_parse(self, buffer_):
         """
         Try to generate a packet from the current string.
@@ -255,8 +267,12 @@ class HTTPMessageParser(object):
             self._type = "response"
         elif message_line[0] in SUPPORTED_METHODS:
             self._type = "request"
+        elif "HTTP" in message_line[0]:
+            packet = self.HTTP_version_not_supported_packet()
+            print("HTTP Version Not Supported")
         else:
-            return f
+            packet = self.not_implemented_packet()
+            print("Not Implemented")
         self._message_line = message_line
         # Transition state once the message-line is read and approved
         self._state = PARSER_STATE_LINE
@@ -500,7 +516,6 @@ class ProxyContext(object):
     def connect_to_server(self, packet):
         host = packet.get_header("Host")
         addr = self.timeout(socket.gethostbyname, 1, host)
-        print(addr)
         if not addr:
             return False
         port = packet.port
@@ -508,9 +523,7 @@ class ProxyContext(object):
         # we go ahead and create it.
         if host not in self.servers.keys():
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            print("Connecting")
             self.timeout(sock.connect, 5, (addr, port))
-            print("Done")
             sock.setblocking(0)
             server = HTTPConnection(sock, addr)
             self.servers[sock.fileno()] = server
@@ -692,4 +705,4 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("Goodbye!")
+        print("\nGoodbye!")
