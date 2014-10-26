@@ -58,6 +58,12 @@ class EmptySocketException(Exception):
 class MalformedRequestException(Exception):
     pass
 
+class NotImplementedException(Exception):
+    pass
+
+class HTTPVersionNotSupportedException(Exception):
+    pass
+
 class Logger(object):
     """
     Our own thread-safe logging implementation.
@@ -268,11 +274,11 @@ class HTTPMessageParser(object):
         elif message_line[0] in SUPPORTED_METHODS:
             self._type = "request"
         elif "HTTP" in message_line[0]:
-            packet = self.HTTP_version_not_supported_packet()
             print("HTTP Version Not Supported")
+            raise HTTPVersionNotSupportedException()
         else:
-            packet = self.not_implemented_packet()
-            print("Not Implemented")
+            print("Not Implemented: ", message_line[0])
+            raise NotImplementedException()
         self._message_line = message_line
         # Transition state once the message-line is read and approved
         self._state = PARSER_STATE_LINE
@@ -599,6 +605,14 @@ class ProxyContext(object):
                 self.close(host)
         except MalformedRequestException as e:
             packet = HTTPMessageParser.bad_request_packet()
+            self.client.packet_queue.put(packet)
+            self.on_recv(self.client.sock.fileno())
+        except NotImplementedException as e:
+            packet = HTTPMessageParser.not_implemented_packet()
+            self.client.packet_queue.put(packet)
+            self.on_recv(self.client.sock.fileno())
+        except HTTPVersionNotSupportedException as e:
+            packet = HTTPMessageParser.HTTP_version_not_supported_packet()
             self.client.packet_queue.put(packet)
             self.on_recv(self.client.sock.fileno())
 
