@@ -288,8 +288,6 @@ class HTTPMessageParser(object):
             key = parts[0]
             value = parts[1].strip() if len(parts) == 2 else ''
             self._headers[key] = value
-            if key == "Connection" and value == "close":
-                print("Got connection: close")
             header = f.readline()
             # Empty line in middle of headers indicates we have yet
             # to recieve more.
@@ -349,11 +347,10 @@ class HTTPMessageParser(object):
             try:
                 chunk_length = int(l, 16)
             except Exception as e:
-                print(e)
+                raise e
             if chunk_length == 0:
                 self._payload += CRLF
-                if len(self._payload[:16]) < 16:
-                    print("First chunk has length 0, so we close")
+                if len(self._payload) < 12:
                     #First chunk has length 0
                     self._headers["Connection"] = "close"
                 self._state = PARSER_STATE_DATA
@@ -493,42 +490,48 @@ class ProxyContext(object):
         self.on_disc = disconnect_callback
         self.close_connection = False
 
-    def timeout(self, func, timeout, *args):
+    def get_host_by_name(self, host):
         """
-        A function that wraps arbitrary functions with a timeout.
+        A function that wraps gethostbyname with a timeout
+        as the function is provided by the kernel and by
+        default blocks everything for 30 secs if the host
+        is invalid.
         """
+        name = ""
         # Signal handler raises error
-        ret = None
         def handler(signum, frame):
             raise Exception("timed out!")
         signal.signal(signal.SIGALRM, handler)
-        # send SIGALRM to ourselves.
-        signal.alarm(timeout)
+        # send SIGALRM to ourselves in 1 sec.
+        signal.alarm(1)
         try:
-            ret = func(*args)
+            name = socket.gethostbyname(host)
         # Catch exception thrown by signal handler if timout has expired.
         except Exception as e:
             pass
-        # If the function succeeds we unregister the signal handler.
+        # If gethostbyname succeeds we unregister the signal handler.
         signal.signal(signal.SIGALRM, signal.SIG_IGN)
-        return ret
+        return name
 
     def connect_to_server(self, packet):
         host = packet.get_header("Host")
-        addr = self.timeout(socket.gethostbyname, 1, host)
+        addr = self.get_host_by_name(host)
         if not addr:
             return False
         port = packet.port
         # If we do not already have an open connection to this server
         # we go ahead and create it.
         if host not in self.servers.keys():
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.timeout(sock.connect, 5, (addr, port))
-            sock.setblocking(0)
-            server = HTTPConnection(sock, addr)
-            self.servers[sock.fileno()] = server
-            self.servers[host] = server
-            self.register(self, sock.fileno(), select.EPOLLOUT)
+            # Set a 5 sec timeout on connect
+            try:
+                sock = socket.create_connection((addr, port), 5)
+                sock.setblocking(0)
+                server = HTTPConnection(sock, addr)
+                self.servers[sock.fileno()] = server
+                self.servers[host] = server
+                self.register(self, sock.fileno(), select.EPOLLOUT)
+            except socket.timeout as e:
+                return False
         return True
 
     def handle_packet(self, packet, log_message=None):
@@ -555,13 +558,11 @@ class ProxyContext(object):
             self.on_recv(self.client.sock.fileno())
 
     def close(self, conn):
-        if conn.packet_queue._qsize() == 0:
-            self.on_disc(conn.sock.fileno(), conn.disconnect())
-            self.servers = {key: value for key, value in self.servers.items()
-                            if value != conn}
+        self.on_disc(conn.sock.fileno(), conn.disconnect())
+        self.servers = {key: value for key, value in self.servers.items()
+                        if value != conn}
 
     def close_all(self):
-        self.close(self.client)
         # Iterate over servers and disconnect them as well
         for (key, server) in self.servers.items():
             # this check is nessecary as each server appears twice in the
@@ -569,14 +570,13 @@ class ProxyContext(object):
             if type(key) == int:
                 self.close(server)
 
+        self.close(self.client)
+
     def get_host(self, fd):
-        try:
-            if fd == self.client.sock.fileno():
-                return self.client
-            else:
-                return self.servers[fd]
-        except Exception:
-            pass
+        host = self.servers.get(fd)
+        if not host:
+            host = self.client
+        return host
 
     def recv(self, fd):
         host = self.get_host(fd)
@@ -637,17 +637,13 @@ class ProxyServer(object):
         self.connections[fd] = conn
 
     def unregister(self, conn, fd):
-        # TODO delete the fucking hosts somehow? or does that not matter?
-        print("unregister", fd)
         host = conn.get_host(fd)
         host.sock.close()
         del self.connections[fd]
         self.epoll.unregister(fd)
 
     def on_disconnect_callback(self, fd, disconnect):
-        self.epoll.modify(fd, 0)
-        if disconnect:
-            self.unregister(self.connections[fd], fd)
+        self.unregister(self.connections[fd], fd)
 
     def accept_connection(self, fd):
         client_sock, client_addr = self.sock.accept()
