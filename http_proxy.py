@@ -204,11 +204,15 @@ class HTTPMessageParser(object):
 
     @classmethod
     def bad_request_packet(klass):
-        return Response(["HTTP/1.1", "400", "Bad Request"], {}, "")
+        return Response(["HTTP/1.1", "400", "Bad Request\r\n"],
+                {"Content-Length" : "0", "Connection" : "close", "Server": VIA},
+                "")
 
     @classmethod
     def not_found_packet(klass):
-        return Response(["HTTP/1.1", "404", "Not Found"], {}, "")
+        return Response(["HTTP/1.1", "404", "Not Found\r\n"],
+                {"Content-Length" : "0", "Connection" : "close", "Server": VIA},
+                "")
 
     def try_parse(self, buffer_):
         """
@@ -464,12 +468,9 @@ class ProxyContext(object):
         self.on_send = send_callback
         self.on_disc = disconnect_callback
 
-    def get_host_by_name(self, host):
+    def timeout(self, func, timeout, *args):
         """
-        A function that wraps gethostbyname with a timeout
-        as the function is provided by the kernel and by
-        default blocks everything for 30 secs if the host
-        is invalid.
+        A function that wraps arbitrary functions with a timeout.
         """
         name = ""
         # Signal handler raises error
@@ -477,9 +478,9 @@ class ProxyContext(object):
             raise Exception("timed out!")
         signal.signal(signal.SIGALRM, handler)
         # send SIGALRM to ourselves in 1 sec.
-        signal.alarm(1)
+        signal.alarm(timeout)
         try:
-            name = socket.gethostbyname(host)
+            name = func(args)
         # Catch exception thrown by signal handler if timout has expired.
         except Exception as e:
             pass
@@ -489,7 +490,7 @@ class ProxyContext(object):
 
     def connect_to_server(self, packet):
         host = packet.get_header("Host")
-        addr = self.get_host_by_name(host)
+        addr = self.timeout(socket.gethostbyname, 1, (host,))
         if not addr:
             return False
         port = packet.port
@@ -497,7 +498,9 @@ class ProxyContext(object):
         # we go ahead and create it.
         if host not in self.servers.keys():
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((addr, port))
+            print("Connecting")
+            self.timeout(sock.connect, 5, (addr, port))
+            print("Done")
             sock.setblocking(0)
             server = HTTPConnection(sock, addr)
             self.servers[sock.fileno()] = server
