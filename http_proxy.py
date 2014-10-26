@@ -41,6 +41,13 @@ CONNECTION_ESTABLISHED = CRLF.join([
 
 PARSER_STATE_NONE, PARSER_STATE_LINE, PARSER_STATE_HEADERS, PARSER_STATE_DATA, PARSER_STATE_ERROR = range(5)
 
+STATUS_CODES = {
+        "400" : "Bad Request\r\n",
+        "404" : "Not Found\r\n",
+        "501" : "Not Implemented\r\n",
+        "505" : "HTTP Version Not Supported\r\n"
+        }
+
 """
 We define a few custom exceptions to better indicate
 what happened.
@@ -55,8 +62,15 @@ class parseException(Exception):
 class EmptySocketException(Exception):
     pass
 
-class MalformedRequestException(Exception):
-    pass
+class RequestError(Exception):
+    """
+    Indicates a problem with the request
+    and that a response with statuscode `code`
+    should be sent to the client
+    """
+    def __init__(self, code):
+        self.code = code
+
 
 class Logger(object):
     """
@@ -172,6 +186,7 @@ class Request(HTTP_Message):
 
 class Response(HTTP_Message):
     def __init__(self, resp_line, headers, data):
+        # This fixes responses that do not include a reason
         if len(resp_line) < 3: resp_line.append('')
         self.protocol_version, self.status, self.reason = resp_line
         self.headers = headers
@@ -202,26 +217,8 @@ class HTTPMessageParser(object):
         self._state = PARSER_STATE_NONE
 
     @classmethod
-    def bad_request_packet(klass):
-        return Response(["HTTP/1.1", "400", "Bad Request\r\n"],
-                {"Content-Length" : "0", "Connection" : "close", "Server": VIA},
-                "")
-
-    @classmethod
-    def not_found_packet(klass):
-        return Response(["HTTP/1.1", "404", "Not Found\r\n"],
-                {"Content-Length" : "0", "Connection" : "close", "Server": VIA},
-                "")
-
-    @classmethod
-    def not_implemented_packet(klass):
-        return Response(["HTTP/1.1", "501", "Not Implemented\r\n"],
-                {"Content-Length" : "0", "Server": VIA},
-                "")
-
-    @classmethod
-    def HTTP_version_not_supported_packet(klass):
-        return Response(["HTTP/1.1", "505", "HTTP Version Not Supported\r\n"],
+    def error_packet_for_code(klass, code):
+        return Response(["HTTP/1.1", code, STATUS_CODES[code]],
                 {"Content-Length" : "0", "Connection" : "close", "Server": VIA},
                 "")
 
@@ -265,10 +262,10 @@ class HTTPMessageParser(object):
         elif message_line[0] in SUPPORTED_METHODS:
             self._type = "request"
         elif "HTTP" in message_line[0]:
-            packet = self.HTTP_version_not_supported_packet()
+            raise RequestError("505")
             print("HTTP Version Not Supported")
         else:
-            packet = self.not_implemented_packet()
+            raise RequestError("501")
             print("Not Implemented")
         self._message_line = message_line
         # Transition state once the message-line is read and approved
@@ -409,7 +406,7 @@ class HTTPConnection(object):
             data = self.sock.recv(BUFSIZE)
             if not data:
                 if self.message_buffer:
-                    raise MalformedRequestException()
+                    raise RequestError("400")
                 # If data is empty, that indicates that the client will
                 # send no more data on this connection, and that it should
                 # be closed when all data in flight has reached it's destination.
@@ -537,7 +534,7 @@ class ProxyContext(object):
             if not server:
                 success = self.connect_to_server(packet)
                 if not success:
-                    response = HTTPMessageParser.not_found_packet()
+                    response = HTTPMessageParser.error_packet_for_code("404")
                     self.handle_packet(response, (packet.method, packet.abs_resource))
                     return
                 server = self.servers[packet.get_header("Host")]
@@ -594,8 +591,8 @@ class ProxyContext(object):
                 self.close_all()
             else:
                 self.close(host)
-        except MalformedRequestException as e:
-            packet = HTTPMessageParser.bad_request_packet()
+        except RequestError as e:
+            packet = HTTPMessageParser.error_packet_for_code(e.code)
             self.client.packet_queue.put(packet)
             self.on_recv(self.client.sock.fileno())
 
