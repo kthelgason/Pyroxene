@@ -195,7 +195,7 @@ class HTTPMessageParser(object):
     def __init__(self):
         self._message_line = ''
         self._headers = {}
-        self._payload = b''
+        self._payload = []
         self._type = None
         self._data_remaining = None
         self._state = PARSER_STATE_NONE
@@ -248,7 +248,7 @@ class HTTPMessageParser(object):
 
     def create_packet(self):
         """ Create a packet """
-        args = (self._message_line, self._headers, self._payload)
+        args = (self._message_line, self._headers, ''.join(self._payload))
         return Request(*args) if self._type == "request" else Response(*args)
 
     def parse_message_line(self, f):
@@ -332,38 +332,38 @@ class HTTPMessageParser(object):
         if self._data_remaining:
             f, self._data_remaining = self.read_data_length(f, self._data_remaining)
             if self._data_remaining == 0:
-                self._payload += f.readline()
+                self._payload.append(f.readline())
                 self._data_remaining = None
         while not self._data_remaining:
             l = f.readline()
             if not l:
                 return f
-            self._payload += l
+            self._payload.append(l)
             while l == CRLF or l == '':
                 l = f.readline()
                 if not l:
                     return f
-                self._payload += l
+                self._payload.append(l)
             try:
                 chunk_length = int(l, 16)
             except Exception as e:
                 raise e
             if chunk_length == 0:
-                self._payload += CRLF
-                if len(self._payload) < 12:
+                self._payload.append(CRLF)
+                if len(self._payload) < 8:
                     #First chunk has length 0
                     self._headers["Connection"] = "close"
                 self._state = PARSER_STATE_DATA
                 return f
             f, self._data_remaining = self.read_data_length(f, chunk_length)
             if self._data_remaining == 0:
-                self._payload += f.readline()
+                self._payload.append(f.readline())
                 self._data_remaining = None
 
     def read_data_length(self, f, amount):
         """ Reads a chunk of data, and returns the amount read """
         chunk = f.read(amount)
-        self._payload += chunk
+        self._payload.append(chunk)
         return f, amount - len(chunk)
 
 
