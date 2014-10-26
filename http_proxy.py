@@ -172,6 +172,7 @@ class Request(HTTP_Message):
 
 class Response(HTTP_Message):
     def __init__(self, resp_line, headers, data):
+        if len(resp_line) < 3: resp_line.append('')
         self.protocol_version, self.status, self.reason = resp_line
         self.headers = headers
         self.data = data
@@ -232,19 +233,15 @@ class HTTPMessageParser(object):
         """
         # Create a file object from the buffer
         f = cStringIO.StringIO(buffer_)
-        try:
-            if self._state == PARSER_STATE_NONE:
-                f = self.parse_message_line(f)
-            if self._state == PARSER_STATE_LINE:
-                f = self.parse_message_headers(f)
-            if self._state == PARSER_STATE_HEADERS:
-                f = self.parse_message_data(f)
-            if self._state == PARSER_STATE_DATA:
-                return self.create_packet()
-            return None
-        except Exception as e:
-            # TODO: ?????
-            raise e
+        if self._state == PARSER_STATE_NONE:
+            f = self.parse_message_line(f)
+        if self._state == PARSER_STATE_LINE:
+            f = self.parse_message_headers(f)
+        if self._state == PARSER_STATE_HEADERS:
+            f = self.parse_message_data(f)
+        if self._state == PARSER_STATE_DATA:
+            return self.create_packet()
+        return None
 
     def create_packet(self):
         """ Create a packet """
