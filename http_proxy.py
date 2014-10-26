@@ -1,20 +1,36 @@
-from __future__ import print_function
+# -*- coding: utf-8 -*-
+"""
+Pyroxene v.0.1
+
+An event-driven proxy server.
+
+license: 2-Clause BSD License.
+
+The server listens for incoming connections on it's port, given in
+a command-line argument, and spawns
+
+"""
+from __future__ import print_function, with_statement
 
 import sys
-import os
+import errno
 import socket
+import select
+import signal
 import argparse
 import threading
 import urlparse
+import cStringIO
 from time import strftime, gmtime
+from Queue import Queue, Empty
 
 PROXY_VERSION = "0.1"
 PROXY_NAME = "Pyroxene"
 VIA = PROXY_VERSION + " " + PROXY_NAME
 LISTEN_ADDRESS = ''
-BUFSIZE = 8192
-SUPPORTED_METHODS = ['GET', 'POST', 'HEAD', 'CONNECT']
-SUPPORTED_PROTOCOLS = ['HTTP/1.1']
+BUFSIZE = 65536
+SUPPORTED_METHODS = ['GET', 'POST', 'HEAD']
+SUPPORTED_PROTOCOLS = ['HTTP/1.1', 'HTTP/1.0']
 CRLF = '\r\n'
 
 CONNECTION_ESTABLISHED = CRLF.join([
@@ -23,7 +39,23 @@ CONNECTION_ESTABLISHED = CRLF.join([
             CRLF
         ])
 
+PARSER_STATE_NONE, PARSER_STATE_LINE, PARSER_STATE_HEADERS, PARSER_STATE_DATA, PARSER_STATE_ERROR = range(5)
+
+"""
+We define a few custom exceptions to better indicate
+what happened.
+"""
+
 class LoggerException(Exception):
+    pass
+
+class parseException(Exception):
+    pass
+
+class EmptySocketException(Exception):
+    pass
+
+class MalformedRequestException(Exception):
     pass
 
 class Logger(object):
@@ -55,7 +87,7 @@ class Logger(object):
         return klass._instance
 
     def __init__(self):
-        self.logfmt = " : %s:%d %s %s : %s\n"
+        self.logfmt = " : %s:%d %s %s : %s %s\n"
         self.timefmt = "%Y-%m-%dT%H:%M:%S+0000"
         self.logfile = None
         self._file_lock = threading.Lock()
@@ -77,6 +109,10 @@ class Logger(object):
 
 
 class HTTP_Message(object):
+    """
+    A parent class for HTTP response and requests messages.
+    This class is never instatiated directly.
+    """
     def __init__(self, headers, data):
         pass
 
@@ -84,6 +120,9 @@ class HTTP_Message(object):
         return self.headers.get(key)
 
     def toRaw(self):
+        """
+        return a raw string representation of the packet.
+        """
         raw = ''
         for (key,value) in self.headers.iteritems():
             raw += key + ": " + value + CRLF
@@ -92,16 +131,36 @@ class HTTP_Message(object):
             raw += self.data
         return raw
 
+    def is_request(self):
+        return self.__class__ == Request
+
 
 class Request(HTTP_Message):
+    """
+    In-memory representation of a HTTP request.
+    The initializer deals with rewriting headers and other
+    duties a proxy should perform.
+    """
     def __init__(self, req_line, headers, data):
+        super(Request, self).__init__(headers, data)
         self.method, self.resource, self.protocol_version = req_line
+        # keep track of the aboslute path, before rewriting.
+        self.abs_resource = self.resource
         url = urlparse.urlsplit(self.resource)
-        if self.method == "CONNECT":
-            print("SECURE")
-            headers["Host"], self.port = url.path.split(":")
-        elif url:
+        path = url.path
+        if path == '':
+            path = '/'
+        if not url.query == '':
+            path += '?' + url.query
+        if not url.fragment == '':
+            path += '#' + url.fragment
+        self.resource = path
+        if url:
+            # replace the Host header field with the value from the resource
+            # string, as per RFC 7230.
             headers["Host"], self.port = url.hostname, url.port if url.port else 80
+        if self.method == "HTTP/1.0" and headers["Connection"]:
+            headers["Connection"] = "close"
         self.headers = headers
         self.data = data
 
@@ -123,149 +182,426 @@ class Response(HTTP_Message):
         return raw
 
 
-class HTTPMessageFactory(object):
+class HTTPMessageParser(object):
+    """
+    This class encapsulates the message-parsing functionality.
+    It is insantiated for each connection object and keeps track of
+    the state of the packet recieved so far.
+
+    As we cannot be sure that we recieve the whole packet at once,
+    we must keep all intermediate state in the message parser.
+    """
+
+    def __init__(self):
+        self._message_line = ''
+        self._headers = {}
+        self._payload = b''
+        self._type = None
+        self._data_remaining = None
+        self._state = PARSER_STATE_NONE
 
     @classmethod
-    def create_message(self, from_socket):
-        f = from_socket.makefile('rb')
-        headers = {}
-        message_line = f.readline()
-        message_line = message_line.split(" ", 2)
-        if message_line == ['']:
-            raise Exception
+    def bad_request_packet(klass):
+        return Response(["HTTP/1.1", "400", "Bad Request\r\n"],
+                {"Content-Length" : "0", "Connection" : "close", "Server": VIA},
+                "")
 
+    @classmethod
+    def not_found_packet(klass):
+        return Response(["HTTP/1.1", "404", "Not Found\r\n"],
+                {"Content-Length" : "0", "Connection" : "close", "Server": VIA},
+                "")
+
+    def try_parse(self, buffer_):
+        """
+        Try to generate a packet from the current string.
+        The packet is implemented as a state-machine keeping track
+        of how much of the message we have recieved thusfar.
+        """
+        # Create a file object from the buffer
+        f = cStringIO.StringIO(buffer_)
+        try:
+            if self._state == PARSER_STATE_NONE:
+                f = self.parse_message_line(f)
+            if self._state == PARSER_STATE_LINE:
+                f = self.parse_message_headers(f)
+            if self._state == PARSER_STATE_HEADERS:
+                f = self.parse_message_data(f)
+            if self._state == PARSER_STATE_DATA:
+                return self.create_packet()
+            return None
+        except Exception as e:
+            # TODO: ?????
+            raise e
+
+    def create_packet(self):
+        """ Create a packet """
+        args = (self._message_line, self._headers, self._payload)
+        return Request(*args) if self._type == "request" else Response(*args)
+
+    def parse_message_line(self, f):
+        self._message_line += f.readline()
+        # Handle empty line at start of packet
+        if self._message_line == CRLF:
+            self._message_line += f.readline()
+        # Some message lines are so long that we don't get the whole thing
+        # in one recv call
+        if not self._message_line or not self._message_line.endswith(CRLF):
+            return f
+        message_line = self._message_line.split(" ", 2)
+        if message_line == ['']:
+            raise parseException("No message line")
         if message_line[0] in SUPPORTED_PROTOCOLS:
-            type_ = "response"
+            self._type = "response"
         elif message_line[0] in SUPPORTED_METHODS:
-            type_ = "request"
+            self._type = "request"
         else:
-            print(message_line[0])
-            pass
-            # TODO: malformed request 400 error
+            return f
+        self._message_line = message_line
+        # Transition state once the message-line is read and approved
+        self._state = PARSER_STATE_LINE
+        return f
+
+    def parse_message_headers(self, f):
         header = f.readline()
-        while header != CRLF:
+        # Possible empty line at start of headers
+        if header == CRLF:
+            header = f.readline()
+        while header and header != CRLF:
             parts = header.split(':', 1)
             key = parts[0]
-            value = parts[1].strip()
-            headers[key] = value
+            value = parts[1].strip() if len(parts) == 2 else ''
+            self._headers[key] = value
             header = f.readline()
-        via = headers.get("Via")
+            # Empty line in middle of headers indicates we have yet
+            # to recieve more.
+            if not header:
+                return f
+        # Add via header
+        via = self._headers.get("Via")
         if via:
             via += ", " + VIA
-            headers["Via"] = via
+            self._headers["Via"] = via
         else:
-            headers["Via"] = VIA
-        length = headers.get("Content-Length")
-        encoding = headers.get("Transfer-Encoding")
-        payload = CRLF * 2
+            self._headers["Via"] = VIA
+        # Transition state
+        self._state = PARSER_STATE_HEADERS
+        return f
 
+    def parse_message_data(self, f):
+        # check for content-length or chunked data.
+        # we need to check for both upper and lower case strings
+        # as some servers for some reason send headers in uncapitalized.
+        length = self._headers.get("Content-Length")
+        if not length:
+            length = self._headers.get("content-length")
+        encoding = self._headers.get("Transfer-Encoding")
+        if not encoding:
+            encoding = self._headers.get("transfer-encoding")
+        payload = b''
         if length:
-            amount = int(length)
-            s = []
-            while amount > 0:
-                chunk = f.read(amount)
-                if not chunk:
-                    break
-                s.append(chunk)
-                amount -= len(chunk)
-            payload = ''.join(s)
-
+            if not self._data_remaining:
+                self._data_remaining = int(length)
+            f, self._data_remaining = self.read_data_length(f, self._data_remaining)
+            if self._data_remaining == 0:
+                self._state = PARSER_STATE_DATA
         elif encoding and encoding == "chunked":
-            # Read first line of chunked response
+            f = self.parse_chunked_data(f)
+        else:
+            # assume no data if neither content-length or encoding is present.
+            self._state = PARSER_STATE_DATA
+        return f
+
+    def parse_chunked_data(self, f):
+        if self._data_remaining:
+            f, self._data_remaining = self.read_data_length(f, self._data_remaining)
+            if self._data_remaining == 0:
+                self._payload += f.readline()
+                self._data_remaining = None
+        while not self._data_remaining:
             l = f.readline()
-            s = [l]
+            if not l:
+                return f
+            self._payload += l
+            while l == CRLF or l == '':
+                l = f.readline()
+                if not l:
+                    return f
+                self._payload += l
             try:
-                content_len = int(l, 16)
-                while(content_len > 0):
-                    chunk = f.read(content_len)
-                    s.append(chunk)
-                    if not chunk:
-                        break
-                    l = f.readline()
-                    l = f.readline()
-                    s.append(l)
-                    content_len = int(l, 16)
-            except Exception, e:
-                print(e)
-            s.append(CRLF)
-            payload = ''.join(s)
+                chunk_length = int(l, 16)
+            except Exception as e:
+                raise e
+            if chunk_length == 0:
+                self._payload += CRLF
+                if len(self._payload) < 12:
+                    #First chunk has length 0
+                    self._headers["Connection"] = "close"
+                self._state = PARSER_STATE_DATA
+                return f
+            f, self._data_remaining = self.read_data_length(f, chunk_length)
+            if self._data_remaining == 0:
+                self._payload += f.readline()
+                self._data_remaining = None
 
-        args = (message_line, headers, payload)
-        f.close()
+    def read_data_length(self, f, amount):
+        """ Reads a chunk of data, and returns the amount read """
+        chunk = f.read(amount)
+        self._payload += chunk
+        return f, amount - len(chunk)
 
-        return Request(*args) if type_ == "request" else Response(*args)
 
+class HTTPConnection(object):
+    """
+    This class represents a connection object.
+    It keeps track of the state for a connection.
+    The packet queue keeps track of packets destined
+    to this client, which makes sending really simple.
+    """
 
+    def __init__(self, sock, addr):
+        self.sock = sock
+        self.addr = addr
+        self.log_message = None
+        self.message_buffer = b''
+        self.packet_queue = Queue()
+        self.parser = HTTPMessageParser()
+        self.close = False
 
-class ConnectionContext(object):
+    def disconnect(self):
+        """
+        Attempt to disconnect this connection.
+        Returns True if it has disconnected previously.
+        This can occur if the remote terminates the connection.
+        """
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+            return False
+        except Exception:
+            return True
 
-    def __init__(self, client_sock, client_addr):
-        self.client_sock = client_sock
-        self.client_addr = client_addr
-        self.server_sock = None
-        self.server_addr = None
-        print("New connection from %s" % client_addr[0])
-        self.proxy_request()
+    def enqueue(self, packet):
+        """
+        Add a given packet to this connections packet queue.
+        """
+        self.packet_queue.put(packet)
 
-    def connect_to_server(self, host, port):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_addr = socket.gethostbyname(host)
-        sock.connect((self.server_addr, port))
-        self.server_sock = sock
+    def recv(self):
+        """
+        and is responsible for shutting down the connection cleanly.
+        The return type signals the proxyContext wether we recieved a
+        whole packet or whether this socket should be read again.
+        """
+        try:
+            data = self.sock.recv(BUFSIZE)
+            if not data:
+                if self.message_buffer:
+                    raise MalformedRequestException()
+                # If data is empty, that indicates that the client will
+                # send no more data on this connection, and that it should
+                # be closed when all data in flight has reached it's destination.
+                raise EmptySocketException("Socket empty")
 
-    def send_unsupported_method_error(self):
-        print("Unsupported Method!")
+            # Each connection has a message buffer that stores the entire
+            # message recieved.
+            self.message_buffer += data
+            # Check to see if we have a complete packet.
+            packet = self.parser.try_parse(data)
 
-    def send_unsupported_version_error(self):
-        print("Unsupported Protocol Version!")
+            if packet:
+                # Reset connection state to get ready for next read.
+                self.message_buffer = b''
+                self.parser = HTTPMessageParser()
 
-    def close_sockets(self):
-        self.client_sock.close()
-        if self.server_sock:
-            self.server_sock.close()
-        print("Closing connection.")
+            return packet
+        # Non-blocking sockets throw exceptions if they would block
+        # we ignore those errors and try again.
+        except socket.error as e:
+            # TODO might me redundant now, needs testing
+            if e.args[0] == errno.ECONNRESET:
+                raise EmptySocketException("reset")
+            elif e.args[0] != (errno.EAGAIN | errno.EBADF):
+                raise e
 
-    def proxy_request(self):
-        while True:
+    def send(self):
+        """
+        Pops a packet from this connections packet queue and sends it.
+        Uses the messagebuffer to store the amout sent when the buffer
+        is too big to send all at once. Returns true or false depending
+        on wether send was successful.
+        """
+        # If there is not a buffer waiting to be sent,
+        # fill it with the next packet in the queue.
+        if not self.message_buffer:
             try:
-                req = HTTPMessageFactory.create_message(self.client_sock)
-                #if req.method == "CONNECT":
-                #   self.tunnel(req)
-                #   continue
-                self.connect_to_server(req.get_header("Host"), int(req.port))
-                self.server_sock.send(req.toRaw())
-                resp = HTTPMessageFactory.create_message(self.server_sock)
-                connection = resp.get_header("Connection")
-                self.client_sock.send(resp.toRaw())
-                Logger.instance().log(self.client_addr[0],
-                                      self.client_addr[1],
-                                      req.method,
-                                      req.resource,
-                                      resp.status)
-                if connection and connection == "close":
-                    break
-            except Exception, e:
-                print("aw =( {}".format(e))
-                break
-        self.close_sockets()
+                packet = self.packet_queue.get(False)
+            except Empty as e:
+                return True
+            self.message_buffer = packet.toRaw()
+        try:
+            sent = self.sock.send(self.message_buffer)
+            if sent == len(self.message_buffer):
+                self.message_buffer = b''
+                return True
+            else:
+                self.message_buffer = self.message_buffer[sent:]
+                return False
+        # Non-blocking sockets throw exceptions if they would block
+        # we ignore those errors and try again.
+        except socket.error as e:
+            if e.args[0] != errno.EAGAIN:
+                raise e
 
-    def tunnel(self, req):
-        ## TODO after implementing polling
-        self.client_sock.send(CONNECTION_ESTABLISHED)
-        print(req.get_header("Host"))
-        self.connect_to_server(req.get_header("Host"), int(req.port))
-        while True:
-            chunk = self.client_sock.recv(BUFSIZE)
-            if not chunk:
-                print("done")
-                break
-            self.client_sock.send(chunk)
+
+class ProxyContext(object):
+    """
+    Keeps track of the relationship between a client and one or more servers.
+    It has several callbacks to the main server to modify the epoll state.
+    Server connections are tracked in a dict indexed by file descriptor and by
+    hostname. Each server appears twice in the dict for this reason.
+    """
+    def __init__(self, sock, addr,
+                 register_callback,
+                 recv_callback,
+                 send_callback,
+                 disconnect_callback
+                ):
+        self.client = HTTPConnection(sock, addr)
+        self.servers = {}
+        self.register = register_callback
+        self.on_recv = recv_callback
+        self.on_send = send_callback
+        self.on_disc = disconnect_callback
+        self.close_connection = False
+
+    def get_host_by_name(self, host):
+        """
+        A function that wraps gethostbyname with a timeout
+        as the function is provided by the kernel and by
+        default blocks everything for 30 secs if the host
+        is invalid.
+        """
+        name = ""
+        # Signal handler raises error
+        def handler(signum, frame):
+            raise Exception("timed out!")
+        signal.signal(signal.SIGALRM, handler)
+        # send SIGALRM to ourselves in 1 sec.
+        signal.alarm(1)
+        try:
+            name = socket.gethostbyname(host)
+        # Catch exception thrown by signal handler if timout has expired.
+        except Exception as e:
+            pass
+        # If gethostbyname succeeds we unregister the signal handler.
+        signal.signal(signal.SIGALRM, signal.SIG_IGN)
+        return name
+
+    def connect_to_server(self, packet):
+        host = packet.get_header("Host")
+        addr = self.get_host_by_name(host)
+        if not addr:
+            return False
+        port = packet.port
+        # If we do not already have an open connection to this server
+        # we go ahead and create it.
+        if host not in self.servers.keys():
+            # Set a 5 sec timeout on connect
+            try:
+                sock = socket.create_connection((addr, port), 5)
+                sock.setblocking(0)
+                server = HTTPConnection(sock, addr)
+                self.servers[sock.fileno()] = server
+                self.servers[host] = server
+                self.register(self, sock.fileno(), select.EPOLLOUT)
+            except socket.timeout as e:
+                return False
+        return True
+
+    def handle_packet(self, packet, log_message=None):
+        if packet.__class__ == Request:
+            server = self.servers.get(packet.get_header("Host"))
+            if not server:
+                success = self.connect_to_server(packet)
+                if not success:
+                    response = HTTPMessageParser.not_found_packet()
+                    self.handle_packet(response, (packet.method, packet.abs_resource))
+                    return
+                server = self.servers[packet.get_header("Host")]
+            server.enqueue(packet)
+            server.log_message = (packet.method, packet.abs_resource)
+            self.on_recv(server.sock.fileno())
+        else:
+            Logger.instance().log(self.client.addr[0], self.client.addr[1],
+                                  log_message[0],
+                                  log_message[1],
+                                  packet.status,
+                                  packet.reason
+                                 )
+            self.client.enqueue(packet)
+            self.on_recv(self.client.sock.fileno())
+
+    def close(self, conn):
+        self.on_disc(conn.sock.fileno(), conn.disconnect())
+        self.servers = {key: value for key, value in self.servers.items()
+                        if value != conn}
+
+    def close_all(self):
+        # Iterate over servers and disconnect them as well
+        for (key, server) in self.servers.items():
+            # this check is nessecary as each server appears twice in the
+            # dictionary, once keyed on the FD and once on the hostname.
+            if type(key) == int:
+                self.close(server)
+
+        self.close(self.client)
+
+    def get_host(self, fd):
+        host = self.servers.get(fd)
+        if not host:
+            host = self.client
+        return host
+
+    def recv(self, fd):
+        host = self.get_host(fd)
+        if not host:
+            return
+        try:
+            packet = host.recv()
+            if packet:
+                if packet.get_header("Connection") == "close":
+                    self.close_connection = True
+                self.handle_packet(packet, host.log_message)
+                if self.close_connection and host != self.client:
+                    # Close the server that sent Connection: close
+                    self.close(host)
+        except EmptySocketException as e:
+            # Recieved EOF from socket
+            if host == self.client:
+                self.close_all()
+            else:
+                self.close(host)
+        except MalformedRequestException as e:
+            packet = HTTPMessageParser.bad_request_packet()
+            self.client.packet_queue.put(packet)
+            self.on_recv(self.client.sock.fileno())
+
+    def send(self, fd):
+        host = self.get_host(fd)
+        if host.send():
+            self.on_send(fd)
+        if host == self.client and self.close_connection:
+            # If the connection should be closed and we have no pending
+            # server connections, close the client
+            if len(self.servers) == 0:
+                self.close(host)
 
 
 class ProxyServer(object):
 
     def __init__(self, port, ipv6=False):
         self.port = port
+        self.connections = {}
         self.sock = self.initialize_connection(port, ipv6)
 
     def initialize_connection(self, port, ipv6):
@@ -273,18 +609,65 @@ class ProxyServer(object):
         sock = socket.socket(sock_type, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((LISTEN_ADDRESS, port))
-        sock.listen(1)
+        sock.listen(5)
+        sock.setblocking(0)
+
+        self.epoll = select.epoll()
+        self.epoll.register(sock.fileno(), select.EPOLLIN)
         return sock
 
+    def register(self, conn, fd, type_):
+        self.epoll.register(fd, type_)
+        self.connections[fd] = conn
+
+    def unregister(self, conn, fd):
+        host = conn.get_host(fd)
+        host.sock.close()
+        del self.connections[fd]
+        self.epoll.unregister(fd)
+
+    def on_disconnect_callback(self, fd, disconnect):
+        self.unregister(self.connections[fd], fd)
+
+    def accept_connection(self, fd):
+        client_sock, client_addr = self.sock.accept()
+        client_sock.setblocking(0)
+        conn = ProxyContext(client_sock, client_addr, self.register,
+                            self.on_read_callback, self.on_send_callback,
+                            self.on_disconnect_callback)
+        self.register(conn, client_sock.fileno(), select.EPOLLIN)
+
+    def on_read_callback(self, fd):
+        self.epoll.modify(fd, select.EPOLLOUT | select.EPOLLIN)
+
+    def on_send_callback(self, fd):
+        self.epoll.modify(fd, select.EPOLLIN)
+
     def start(self):
-        while True:
-            client_sock, client_addr = self.sock.accept()
-            ConnectionContext(client_sock, client_addr)
-            client_sock.close()
+        try:
+            while True:
+                events = self.epoll.poll(1)
+                for fileno, event in events:
+                    try:
+                        if fileno == self.sock.fileno():
+                            self.accept_connection(fileno)
+                        elif event & select.EPOLLIN:
+                            self.connections[fileno].recv(fileno)
+                        elif event & select.EPOLLOUT:
+                            self.connections[fileno].send(fileno)
+                        elif event & (select.EPOLLHUP | select.EPOLLERR):
+                            self.unregister(self.connections[fileno], fileno)
+                    except KeyError:
+                        continue
+        finally:
+            self.epoll.unregister(self.sock.fileno())
+            self.epoll.close()
+            self.sock.close()
+
 
 def main():
     parser = argparse.ArgumentParser(
-            description="A command-line http proxy server.")
+            description="A full-featured http proxy server.")
     parser.add_argument('port', type=int, help="The port to start the server on")
     parser.add_argument('logfile', help='The logfile to log connections to')
     parser.add_argument('--ipv6', action="store_true", help="Use IPv6")
