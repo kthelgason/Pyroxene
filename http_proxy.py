@@ -481,25 +481,26 @@ class ProxyContext(object):
         """
         A function that wraps arbitrary functions with a timeout.
         """
-        name = ""
         # Signal handler raises error
+        ret = None
         def handler(signum, frame):
             raise Exception("timed out!")
         signal.signal(signal.SIGALRM, handler)
-        # send SIGALRM to ourselves in 1 sec.
+        # send SIGALRM to ourselves.
         signal.alarm(timeout)
         try:
-            name = func(args)
+            ret = func(*args)
         # Catch exception thrown by signal handler if timout has expired.
         except Exception as e:
             pass
-        # If gethostbyname succeeds we unregister the signal handler.
+        # If the function succeeds we unregister the signal handler.
         signal.signal(signal.SIGALRM, signal.SIG_IGN)
-        return name
+        return ret
 
     def connect_to_server(self, packet):
         host = packet.get_header("Host")
-        addr = self.timeout(socket.gethostbyname, 1, (host,))
+        addr = self.timeout(socket.gethostbyname, 1, host)
+        print(addr)
         if not addr:
             return False
         port = packet.port
