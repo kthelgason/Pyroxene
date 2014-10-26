@@ -58,12 +58,6 @@ class EmptySocketException(Exception):
 class MalformedRequestException(Exception):
     pass
 
-class NotImplementedException(Exception):
-    pass
-
-class HTTPVersionNotSupportedException(Exception):
-    pass
-
 class Logger(object):
     """
     Our own thread-safe logging implementation.
@@ -221,7 +215,7 @@ class HTTPMessageParser(object):
     @classmethod
     def not_implemented_packet(klass):
         return Response(["HTTP/1.1", "501", "Not Implemented\r\n"],
-                {"Content-Length" : "0", "Connection" : "close", "Server": VIA},
+                {"Content-Length" : "0", "Server": VIA},
                 "")
 
     @classmethod
@@ -274,9 +268,11 @@ class HTTPMessageParser(object):
         elif message_line[0] in SUPPORTED_METHODS:
             self._type = "request"
         elif "HTTP" in message_line[0]:
-            raise HTTPVersionNotSupportedException()
+            packet = self.HTTP_version_not_supported_packet()
+            print("HTTP Version Not Supported")
         else:
-            raise NotImplementedException()
+            packet = self.not_implemented_packet()
+            print("Not Implemented")
         self._message_line = message_line
         # Transition state once the message-line is read and approved
         self._state = PARSER_STATE_LINE
@@ -442,10 +438,6 @@ class HTTPConnection(object):
                 raise EmptySocketException("reset")
             elif e.args[0] != (errno.EAGAIN | errno.EBADF):
                 raise e
-        except (HTTPVersionNotSupportedException, NotImplementedException) as e:
-            self.message_buffer = b''
-            self.parser = HTTPMessageParser()
-            raise e
 
     def send(self):
         """
@@ -607,14 +599,6 @@ class ProxyContext(object):
                 self.close(host)
         except MalformedRequestException as e:
             packet = HTTPMessageParser.bad_request_packet()
-            self.client.packet_queue.put(packet)
-            self.on_recv(self.client.sock.fileno())
-        except NotImplementedException as e:
-            packet = HTTPMessageParser.not_implemented_packet()
-            self.client.packet_queue.put(packet)
-            self.on_recv(self.client.sock.fileno())
-        except HTTPVersionNotSupportedException as e:
-            packet = HTTPMessageParser.HTTP_version_not_supported_packet()
             self.client.packet_queue.put(packet)
             self.on_recv(self.client.sock.fileno())
 
