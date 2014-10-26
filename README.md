@@ -43,3 +43,14 @@ Kári Tristan Helgason (kari12@ru.is)
 Starkaður Hróbjartsson (starkadur12@ru.is)
 
 Jóhann Eiríksson (johanne12@ru.is)
+
+Features
+========
+* Event-driven
+* Supports multiple clients
+* Logging
+
+Shortcomings
+==========
+* Portability (depends on the linux-specific epoll APIs)
+* Nothing else really
