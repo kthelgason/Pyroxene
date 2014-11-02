@@ -24,6 +24,8 @@ import cStringIO
 from time import strftime, gmtime
 from Queue import Queue, Empty
 
+from proxy_cache import Cache
+
 PROXY_VERSION = "0.1"
 PROXY_NAME = "Pyroxene"
 VIA = PROXY_VERSION + " " + PROXY_NAME
@@ -32,6 +34,7 @@ BUFSIZE = 65536
 SUPPORTED_METHODS = ['GET', 'POST', 'HEAD']
 SUPPORTED_PROTOCOLS = ['HTTP/1.1', 'HTTP/1.0']
 CRLF = '\r\n'
+CACHE_DIR = os.path.abspath("cache")
 
 CONNECTION_ESTABLISHED = CRLF.join([
             'HTTP/1.1 200 Connection established',
@@ -683,6 +686,10 @@ def main():
     parser.add_argument('--ipv6', action="store_true", help="Use IPv6")
     args = parser.parse_args()
     Logger.instance().set_logfile(args.logfile)
+
+    if os.path.exists(CACHE_DIR):
+        os.rmdir(CACHE_DIR)
+    os.mkdir(CACHE_DIR)
 
     print("Starting server on port %d." % args.port)
 
