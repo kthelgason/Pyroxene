@@ -13,6 +13,8 @@ a command-line argument, and spawns
 from __future__ import print_function, with_statement
 
 import sys
+import os
+import shutil
 import errno
 import socket
 import select
@@ -375,7 +377,7 @@ class HTTPConnection(object):
     def __init__(self, sock, addr):
         self.sock = sock
         self.addr = addr
-        self.log_message = None
+        self.request = None
         self.message_buffer = b''
         self.packet_queue = Queue()
         self.parser = HTTPMessageParser()
@@ -474,12 +476,14 @@ class ProxyContext(object):
     hostname. Each server appears twice in the dict for this reason.
     """
     def __init__(self, sock, addr,
+                 cache,
                  register_callback,
                  recv_callback,
                  send_callback,
                  disconnect_callback
                 ):
         self.client = HTTPConnection(sock, addr)
+        self.cache = cache
         self.servers = {}
         self.register = register_callback
         self.on_recv = recv_callback
@@ -531,26 +535,32 @@ class ProxyContext(object):
                 return False
         return True
 
-    def handle_packet(self, packet, log_message=None):
+    def handle_packet(self, packet, request=None):
         if packet.__class__ == Request:
+            cached_response = self.cache.retrieve(packet)
+            if cached_response:
+                print("Cache HIT!")
+                self.handle_packet(cached_response, packet)
+                return
             server = self.servers.get(packet.get_header("Host"))
             if not server:
                 success = self.connect_to_server(packet)
                 if not success:
                     response = HTTPMessageParser.error_packet_for_code("404")
-                    self.handle_packet(response, (packet.method, packet.abs_resource))
+                    self.handle_packet(response, packet)
                     return
                 server = self.servers[packet.get_header("Host")]
             server.enqueue(packet)
-            server.log_message = (packet.method, packet.abs_resource)
+            server.request = packet
             self.on_recv(server.sock.fileno())
         else:
             Logger.instance().log(self.client.addr[0], self.client.addr[1],
-                                  log_message[0],
-                                  log_message[1],
+                                  request.method,
+                                  request.resource,
                                   packet.status,
                                   packet.reason
                                  )
+            self.cache.store(request, packet)
             self.client.enqueue(packet)
             self.on_recv(self.client.sock.fileno())
 
@@ -584,7 +594,7 @@ class ProxyContext(object):
             if packet:
                 if packet.get_header("Connection") == "close":
                     self.close_connection = True
-                self.handle_packet(packet, host.log_message)
+                self.handle_packet(packet, host.request)
                 if self.close_connection and host != self.client:
                     # Close the server that sent Connection: close
                     self.close(host)
@@ -615,6 +625,7 @@ class ProxyServer(object):
     def __init__(self, port, ipv6=False):
         self.port = port
         self.connections = {}
+        self.cache = Cache()
         self.sock = self.initialize_connection(port, ipv6)
 
     def initialize_connection(self, port, ipv6):
@@ -645,7 +656,7 @@ class ProxyServer(object):
     def accept_connection(self, fd):
         client_sock, client_addr = self.sock.accept()
         client_sock.setblocking(0)
-        conn = ProxyContext(client_sock, client_addr, self.register,
+        conn = ProxyContext(client_sock, client_addr, self.cache, self.register,
                             self.on_read_callback, self.on_send_callback,
                             self.on_disconnect_callback)
         self.register(conn, client_sock.fileno(), select.EPOLLIN)
@@ -688,7 +699,7 @@ def main():
     Logger.instance().set_logfile(args.logfile)
 
     if os.path.exists(CACHE_DIR):
-        os.rmdir(CACHE_DIR)
+        shutil.rmtree(CACHE_DIR)
     os.mkdir(CACHE_DIR)
 
     print("Starting server on port %d." % args.port)

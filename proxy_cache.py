@@ -2,10 +2,10 @@ from __future__ import print_function, with_statement
 
 import os
 import time
-import pickle
+import calendar
+import cPickle as pickle
 from hashlib import md5
-
-from http_proxy import Response
+from fnmatch import fnmatch
 
 CACHE_DIR = os.path.abspath("cache")
 
@@ -41,7 +41,8 @@ class DateTimeParser():
     @classmethod
     def stringToDatetime(klass, dateString):
         """
-        Convert an HTTP date string (one of three formats) to seconds since epoch.
+        Convert an HTTP date string (one of three formats)
+        to seconds since epoch.
         @type dateString: C{bytes}
         """
         parts = dateString.split()
@@ -49,7 +50,7 @@ class DateTimeParser():
         if not parts[0][0:3].lower() in klass.weekdayname_lower:
             # Weekday is stupid. Might have been omitted.
             try:
-                return stringToDatetime(b"Sun, " + dateString)
+                return klass.stringToDatetime(b"Sun, " + dateString)
             except ValueError:
                 # Guess not.
                 pass
@@ -57,18 +58,12 @@ class DateTimeParser():
         partlen = len(parts)
         if (partlen == 5 or partlen == 6) and parts[1].isdigit():
             # 1st date format: Sun, 06 Nov 1994 08:49:37 GMT
-            # (Note: "GMT" is literal, not a variable timezone)
-            # (also handles without "GMT")
-            # This is the normal format
             day = parts[1]
             month = parts[2]
             year = parts[3]
             time = parts[4]
         elif (partlen == 3 or partlen == 4) and parts[1].find('-') != -1:
             # 2nd date format: Sunday, 06-Nov-94 08:49:37 GMT
-            # (Note: "GMT" is literal, not a variable timezone)
-            # (also handles without without "GMT")
-            # Two digit year, yucko.
             day, month, year = parts[1].split('-')
             time = parts[2]
             year=int(year)
@@ -90,64 +85,100 @@ class DateTimeParser():
         month = int(klass.monthname_lower.index(month.lower()))
         year = int(year)
         hour, min, sec = map(int, time.split(':'))
-        return int(timegm(year, month, day, hour, min, sec))
+        return int(klass.timegm(year, month, day, hour, min, sec))
 
 
 class CacheEntry():
-    def __init__(self, key, data, directives):
+    def __init__(self, key, response, ttl):
         self.timestamp = time.ctime()
-        self.directives = map(lambda x: x.strip(), directives.split(","))
+        self.ttl = ttl
         self.key = key
-        with open(key, 'w+') as f:
-            f.write(response.data)
+        with open(os.path.join(CACHE_DIR, key), 'w+') as f:
+            pickle.dump(response, f)
 
     def data(self):
-        with open(self.key, 'r') as f:
-            data = f.read()
-        return data
+        with open(os.path.join(CACHE_DIR, self.key), 'r') as f:
+            data = pickle.load(f)
+        return data if self.is_fresh() else None
+
+    def is_fresh(self):
+        return time.time() < self.ttl
 
 class Cache():
     def __init__(self):
         self.map = {}
 
-
-    def key_from_response(self, response):
+    def key_from_message(self, response):
         """
         Construct a cache-key from the response object
         by calculating the md5 hash of the URI and any
         `vary` header values that may be present.
         """
         # TODO: handle Vary: *
-        key = response.uri
+        key = response.resource
         vary = response.get_header("Vary")
         if vary:
             for hf in vary.split(","):
                 # if this header is present in the response,
                 # add it to the digest
                 key += response.get_header(hf) or ''
-        key = md5(key).digest()
+        key = md5(key).hexdigest()
         return key
 
-    def should_cache(self, response):
+    def should_cache(self, request, response):
         """
         Determines whether the response should be cached
-        according to the RFC.
+        according to the RFC. If the response should be cached,
+        this method returns it's expiration time.
         """
-        directives = response.get_header("Cache-Control")
-        directives = map(lambda x: x.strip().tolower(), directives.split(","))
-        if "max-age" in directives or "s-maxage" in directives:
+        if request.method != "GET" or response.status != "200":
+            return None
+        resp_directives = response.get_header("Cache-Control")
+        req_directives = request.get_header("Cache-Control")
+        if req_directives:
+            req_directives = map(lambda x: x.strip().lower(),
+                    req_directives.split(","))
+            for directive in req_directives:
+                if fnmatch("no-store", directive):
+                    return None
+                if fnmatch("no-cache", directive):
+                    return None
+        if request.get_header("Authorization"):
+            return None
+        if not resp_directives:
+            expires = response.get_header("Expires")
             return True
-        elif response.get_header("Expires"):
-            return True
-        return False
+        resp_directives = map(lambda x: x.strip().lower(),
+                resp_directives.split(","))
+        for directive in resp_directives:
+            if fnmatch("no-store", directive):
+                return None
+            if fnmatch("private", directive):
+                return None
+            if fnmatch("s-maxage*", directive):
+                return time.time() + float(directive.split("=")[1])
+            if fnmatch(directive, "max-age*"):
+                return time.time() + float(directive.split("=")[1])
+        expires = response.get_header("Expires")
+        date = response.get_header("Date")
+        if expires and date:
+            try:
+                return (DateTimeParser.stringToDatetime(expires))
+            except ValueError as e:
+                print(e)
+                print(response.headers)
+            return None
+        return None
 
-    def store(self, response):
-        key = self.key_from_response(response)
-        if self.should_cache(response):
-            self.map[key] = CacheEntry(key, response.data, directives)
+    def store(self, request, response):
+        ttl = self.should_cache(request, response)
+        if ttl:
+            key = self.key_from_message(request)
+            self.map[key] = CacheEntry(key, response, ttl)
 
-    def retrieve(self, response):
-        key = self.key_from_response(response)
-        return self.map[key].data()
+    def retrieve(self, request):
+        key = self.key_from_message(request)
+        cached_response = self.map.get(key)
+        return cached_response.data() if cached_response else None
 
 
