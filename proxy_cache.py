@@ -43,12 +43,11 @@ class DateTimeParser():
         """
         Convert an HTTP date string (one of three formats)
         to seconds since epoch.
-        @type dateString: C{bytes}
         """
         parts = dateString.split()
 
         if not parts[0][0:3].lower() in klass.weekdayname_lower:
-            # Weekday is stupid. Might have been omitted.
+            # Weekday might be omitted.
             try:
                 return klass.stringToDatetime(b"Sun, " + dateString)
             except ValueError:
@@ -84,8 +83,8 @@ class DateTimeParser():
         day = int(day)
         month = int(klass.monthname_lower.index(month.lower()))
         year = int(year)
-        hour, min, sec = map(int, time.split(':'))
-        return int(klass.timegm(year, month, day, hour, min, sec))
+        hour, min_, sec = map(int, time.split(':'))
+        return int(klass.timegm(year, month, day, hour, min_, sec))
 
 
 class CacheEntry():
@@ -165,9 +164,7 @@ class Cache():
             try:
                 return (DateTimeParser.stringToDatetime(expires))
             except ValueError as e:
-                print(e)
-                print(response.headers)
-            return None
+                pass
         return None
 
     def store(self, request, response):

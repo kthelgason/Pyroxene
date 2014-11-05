@@ -504,7 +504,7 @@ class ProxyContext(object):
             raise Exception("timed out!")
         signal.signal(signal.SIGALRM, handler)
         # send SIGALRM to ourselves in 1 sec.
-        signal.alarm(1)
+        signal.alarm(2)
         try:
             name = socket.gethostbyname(host)
         # Catch exception thrown by signal handler if timout has expired.
