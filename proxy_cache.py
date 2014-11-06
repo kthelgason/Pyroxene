@@ -114,7 +114,7 @@ class Cache():
         `vary` header values that may be present.
         """
         # TODO: handle Vary: *
-        key = response.resource
+        key = response.abs_resource
         vary = response.get_header("Vary")
         if vary:
             for hf in vary.split(","):

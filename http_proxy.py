@@ -268,10 +268,8 @@ class HTTPMessageParser(object):
             self._type = "request"
         elif "HTTP" in message_line[0]:
             raise RequestError("505")
-            print("HTTP Version Not Supported")
         else:
             raise RequestError("501")
-            print("Not Implemented")
         self._message_line = message_line
         # Transition state once the message-line is read and approved
         self._state = PARSER_STATE_LINE
@@ -539,7 +537,7 @@ class ProxyContext(object):
         if packet.__class__ == Request:
             cached_response = self.cache.retrieve(packet)
             if cached_response:
-                print("Cache HIT!")
+                print("Cache hit for %s" % packet.abs_resource)
                 self.handle_packet(cached_response, packet)
                 return
             server = self.servers.get(packet.get_header("Host"))
@@ -556,7 +554,7 @@ class ProxyContext(object):
         else:
             Logger.instance().log(self.client.addr[0], self.client.addr[1],
                                   request.method,
-                                  request.resource,
+                                  request.abs_resource,
                                   packet.status,
                                   packet.reason
                                  )
@@ -608,6 +606,7 @@ class ProxyContext(object):
             packet = HTTPMessageParser.error_packet_for_code(e.code)
             self.client.packet_queue.put(packet)
             self.on_recv(self.client.sock.fileno())
+            self.close(host)
 
     def send(self, fd):
         host = self.get_host(fd)
