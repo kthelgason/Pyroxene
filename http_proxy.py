@@ -196,6 +196,8 @@ class Response(HTTP_Message):
         self.protocol_version, self.status, self.reason = resp_line
         if self.protocol_version == "HTTP/1.0" and headers["Connection"]:
             headers["Connection"] = "close"
+        if self.status != "200":
+            headers["Connection"]  = "close"
         self.headers = headers
         self.data = data
 
