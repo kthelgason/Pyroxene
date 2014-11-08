@@ -194,7 +194,7 @@ class Response(HTTP_Message):
         # This fixes responses that do not include a reason
         if len(resp_line) < 3: resp_line.append('')
         self.protocol_version, self.status, self.reason = resp_line
-	if self.protocol_version == "HTTP/1.0" and headers["Connection"]:
+        if self.protocol_version == "HTTP/1.0" and headers["Connection"]:
             headers["Connection"] = "close"
         self.headers = headers
         self.data = data
