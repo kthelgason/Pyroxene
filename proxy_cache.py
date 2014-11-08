@@ -98,7 +98,9 @@ class CacheEntry():
     def data(self):
         with open(os.path.join(CACHE_DIR, self.key), 'r') as f:
             data = pickle.load(f)
-        return data if self.is_fresh() else None
+        if not self.is_fresh():
+            data.needs_validation = True
+        return data
 
     def is_fresh(self):
         return time.time() < self.ttl
@@ -144,20 +146,18 @@ class Cache():
                     return None
         if request.get_header("Authorization"):
             return None
-        if not resp_directives:
-            expires = response.get_header("Expires")
-            return True
-        resp_directives = map(lambda x: x.strip().lower(),
-                resp_directives.split(","))
-        for directive in resp_directives:
-            if fnmatch("no-store", directive):
-                return None
-            if fnmatch("private", directive):
-                return None
-            if fnmatch("s-maxage*", directive):
-                return time.time() + float(directive.split("=")[1])
-            if fnmatch(directive, "max-age*"):
-                return time.time() + float(directive.split("=")[1])
+        if resp_directives:
+            resp_directives = map(lambda x: x.strip().lower(),
+                    resp_directives.split(","))
+            for directive in resp_directives:
+                if fnmatch("no-store", directive):
+                    return None
+                if fnmatch("private", directive):
+                    return None
+                if fnmatch("s-maxage*", directive):
+                    return time.time() + float(directive.split("=")[1])
+                if fnmatch(directive, "max-age*"):
+                    return time.time() + float(directive.split("=")[1])
         expires = response.get_header("Expires")
         date = response.get_header("Date")
         if expires and date:

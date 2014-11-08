@@ -200,6 +200,9 @@ class Response(HTTP_Message):
             headers["Connection"]  = "close"
         self.headers = headers
         self.data = data
+        # Used by the cache to indicate that a validation request
+        # should be sent.
+        self.needs_validation = False
 
     def toRaw(self):
         raw = ' '.join((self.protocol_version, self.status, self.reason))
@@ -224,6 +227,15 @@ class HTTPMessageParser(object):
         self._type = None
         self._data_remaining = None
         self._state = PARSER_STATE_NONE
+
+    @classmethod
+    def validation_packet_for_request(klass, request, last_modified):
+        headers = request.headers
+        headers["If-Modified-Since"] = last_modified
+        host = headers["Host"]
+        message_line = ["GET", "http://" + host + request.resource,
+                        "HTTP/1.1\r\n"]
+        return Request(message_line, headers, "")
 
     @classmethod
     def error_packet_for_code(klass, code):
@@ -537,12 +549,31 @@ class ProxyContext(object):
                 return False
         return True
 
-    def handle_packet(self, packet, request=None):
+    def validate_response(self, request, response):
+        """
+        Validates a stored cache response
+        for a given request
+        """
+        last_modified = response.get_header("Last-Modified")
+        if last_modified:
+            packet = HTTPMessageParser.validation_packet_for_request(
+                    request, last_modified)
+            self.handle_packet(packet, nocache=True)
+
+    def handle_packet(self, packet, request=None, nocache=False):
+        """
+        This method does all the packet handling magic.
+        """
         if packet.__class__ == Request:
             cached_response = self.cache.retrieve(packet)
-            if cached_response:
-                print("Cache hit for %s" % packet.abs_resource)
-                self.handle_packet(cached_response, packet)
+            # A cached response was available
+            if cached_response and not nocache:
+                print("Cache hit")
+                # Validate it if it's not fresh
+                if cached_response.needs_validation:
+                    self.validate_response(packet, cached_response)
+                else:
+                    self.handle_packet(cached_response, packet, nocache=True)
                 return
             server = self.servers.get(packet.get_header("Host"))
             if not server:
@@ -562,7 +593,14 @@ class ProxyContext(object):
                                   packet.status,
                                   packet.reason
                                  )
-            self.cache.store(request, packet)
+            if packet.status == "304":
+                # Response successfully validated.
+                # Retrieve it from cache and send to the client.
+                cached_response = self.cache.retrieve(request)
+                self.handle_packet(cached_response, request, nocache=True)
+                return
+            if not nocache:
+                self.cache.store(request, packet)
             self.client.enqueue(packet)
             self.on_recv(self.client.sock.fileno())
 
@@ -607,10 +645,10 @@ class ProxyContext(object):
             else:
                 self.close(host)
         except RequestError as e:
+            self.client.message_buffer = b''
             packet = HTTPMessageParser.error_packet_for_code(e.code)
             self.client.packet_queue.put(packet)
             self.on_recv(self.client.sock.fileno())
-            self.close(host)
 
     def send(self, fd):
         host = self.get_host(fd)
@@ -702,8 +740,9 @@ def main():
     Logger.instance().set_logfile(args.logfile)
 
     if os.path.exists(CACHE_DIR):
-        shutil.rmtree(CACHE_DIR)
-    os.mkdir(CACHE_DIR)
+        pass
+        #shutil.rmtree(CACHE_DIR)
+    #os.mkdir(CACHE_DIR)
 
     print("Starting server on port %d." % args.port)
 
