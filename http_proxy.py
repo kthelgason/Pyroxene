@@ -33,7 +33,7 @@ PROXY_NAME = "Pyroxene"
 VIA = PROXY_VERSION + " " + PROXY_NAME
 LISTEN_ADDRESS = ''
 BUFSIZE = 65536
-SUPPORTED_METHODS = ['GET', 'POST', 'HEAD']
+SUPPORTED_METHODS = ['GET', 'POST', 'HEAD', 'CONNECT']
 SUPPORTED_PROTOCOLS = ['HTTP/1.1', 'HTTP/1.0']
 CRLF = '\r\n'
 CACHE_DIR = os.path.abspath("cache")
@@ -174,12 +174,16 @@ class Request(HTTP_Message):
         if not url.fragment == '':
             path += '#' + url.fragment
         self.resource = path
-        if url:
+        if self.method == "CONNECT":
+            headers["Host"], self.port = url.path.split(":")
+            self.port = int(self.port)
+        elif url:
             # replace the Host header field with the value from the resource
             # string, as per RFC 7230.
             headers["Host"], self.port = url.hostname, url.port if url.port else 80
         if self.method == "POST" and headers["Connection"]:
             headers["Connection"] = "close"
+        self.url = headers.get("Host")
         self.headers = headers
         self.data = data
 
@@ -197,7 +201,7 @@ class Response(HTTP_Message):
         if self.protocol_version == "HTTP/1.0" and headers["Connection"]:
             headers["Connection"] = "close"
         if self.status != "200":
-            headers["Connection"]  = "close"
+            headers["Connection"] = "close"
         self.headers = headers
         self.data = data
         # Used by the cache to indicate that a validation request
@@ -393,13 +397,15 @@ class HTTPConnection(object):
         self.addr = addr
         self.request = None
         self.message_buffer = b''
+        self.recv_buffer = b''
         self.packet_queue = Queue()
         self.parser = HTTPMessageParser()
         self.close = False
+        self.https = False
 
-    def disconnect(self):
+    def shutdown(self):
         """
-        Attempt to disconnect this connection.
+        Attempt to gracefully shutdown this connection.
         Returns True if it has disconnected previously.
         This can occur if the remote terminates the connection.
         """
@@ -433,13 +439,16 @@ class HTTPConnection(object):
 
             # Each connection has a message buffer that stores the entire
             # message recieved.
-            self.message_buffer += data
+            self.recv_buffer += data
             # Check to see if we have a complete packet.
-            packet = self.parser.try_parse(data)
+            if self.https:
+                packet = self.recv_buffer
+            else:
+                packet = self.parser.try_parse(data)
 
             if packet:
                 # Reset connection state to get ready for next read.
-                self.message_buffer = b''
+                self.recv_buffer = b''
                 self.parser = HTTPMessageParser()
 
             return packet
@@ -466,12 +475,15 @@ class HTTPConnection(object):
                 packet = self.packet_queue.get(False)
             except Empty as e:
                 return True
-            self.message_buffer = packet.toRaw()
+            if not self.https:
+                self.message_buffer = packet.toRaw()
+            else:
+                self.message_buffer = packet
         try:
             sent = self.sock.send(self.message_buffer)
             if sent == len(self.message_buffer):
                 self.message_buffer = b''
-                return True
+                return False
             else:
                 self.message_buffer = self.message_buffer[sent:]
                 return False
@@ -544,7 +556,7 @@ class ProxyContext(object):
                 server = HTTPConnection(sock, addr)
                 self.servers[sock.fileno()] = server
                 self.servers[host] = server
-                self.register(self, sock.fileno(), select.EPOLLOUT)
+                self.register(self, sock.fileno(), select.EPOLLIN | select.EPOLLOUT)
             except socket.timeout as e:
                 return False
         return True
@@ -558,9 +570,19 @@ class ProxyContext(object):
         if last_modified:
             packet = HTTPMessageParser.validation_packet_for_request(
                     request, last_modified)
-            self.handle_packet(packet, nocache=True)
+            self.handle_packet(None, packet, None, True)
 
-    def handle_packet(self, packet, request=None, nocache=False):
+    def handle_secure_packet(self, packet, host):
+        if host == self.client:
+                server = self.servers.get(host.request.url)
+                if server:
+                    server.enqueue(packet)
+                    self.on_recv(server.sock.fileno())
+        else:
+            self.client.enqueue(packet)
+            self.on_recv(self.client.sock.fileno())
+
+    def handle_packet(self, host, packet, request=None, nocache=False):
         """
         This method does all the packet handling magic.
         """
@@ -573,16 +595,24 @@ class ProxyContext(object):
                 if cached_response.needs_validation:
                     self.validate_response(packet, cached_response)
                 else:
-                    self.handle_packet(cached_response, packet, nocache=True)
+                    self.handle_packet(None, cached_response, packet, nocache=True)
                 return
             server = self.servers.get(packet.get_header("Host"))
             if not server:
                 success = self.connect_to_server(packet)
                 if not success:
                     response = HTTPMessageParser.error_packet_for_code("404")
-                    self.handle_packet(response, packet)
+                    self.handle_packet(None, response, packet)
                     return
                 server = self.servers[packet.get_header("Host")]
+            if packet.method == "CONNECT":
+                host.https = True
+                host.request = packet
+                server.https = True
+                server.request = packet
+                self.client.sock.send(CONNECTION_ESTABLISHED)
+                self.on_send(self.client.sock.fileno())
+                return
             server.enqueue(packet)
             server.request = packet
             self.on_recv(server.sock.fileno())
@@ -597,15 +627,18 @@ class ProxyContext(object):
                 # Response successfully validated.
                 # Retrieve it from cache and send to the client.
                 cached_response = self.cache.retrieve(request)
-                self.handle_packet(cached_response, request, nocache=True)
-                return
+                if cached_response:
+                    print("Cache retrieved")
+                    self.handle_packet(None, cached_response, request, nocache=True)
+                    return
             if not nocache:
                 self.cache.store(request, packet)
             self.client.enqueue(packet)
             self.on_recv(self.client.sock.fileno())
 
     def close(self, conn):
-        self.on_disc(conn.sock.fileno(), conn.disconnect())
+        conn.shutdown()
+        self.on_disc(conn.sock.fileno())
         self.servers = {key: value for key, value in self.servers.items()
                         if value != conn}
 
@@ -632,9 +665,12 @@ class ProxyContext(object):
         try:
             packet = host.recv()
             if packet:
+                if host.https:
+                    self.handle_secure_packet(packet, host)
+                    return
+                self.handle_packet(host, packet, host.request)
                 if packet.get_header("Connection") == "close":
                     self.close_connection = True
-                self.handle_packet(packet, host.request)
                 if self.close_connection and host != self.client:
                     # Close the server that sent Connection: close
                     self.close(host)
@@ -691,7 +727,7 @@ class ProxyServer(object):
         del self.connections[fd]
         self.epoll.unregister(fd)
 
-    def on_disconnect_callback(self, fd, disconnect):
+    def on_disconnect_callback(self, fd):
         self.unregister(self.connections[fd], fd)
 
     def accept_connection(self, fd):
@@ -740,9 +776,8 @@ def main():
     Logger.instance().set_logfile(args.logfile)
 
     if os.path.exists(CACHE_DIR):
-        pass
-        #shutil.rmtree(CACHE_DIR)
-    #os.mkdir(CACHE_DIR)
+        shutil.rmtree(CACHE_DIR)
+    os.mkdir(CACHE_DIR)
 
     print("Starting server on port %d." % args.port)
 
