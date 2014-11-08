@@ -178,7 +178,7 @@ class Request(HTTP_Message):
             # replace the Host header field with the value from the resource
             # string, as per RFC 7230.
             headers["Host"], self.port = url.hostname, url.port if url.port else 80
-        if self.method == "HTTP/1.0" and headers["Connection"]:
+        if self.method == "POST" and headers["Connection"]:
             headers["Connection"] = "close"
         self.headers = headers
         self.data = data
@@ -194,6 +194,8 @@ class Response(HTTP_Message):
         # This fixes responses that do not include a reason
         if len(resp_line) < 3: resp_line.append('')
         self.protocol_version, self.status, self.reason = resp_line
+	if self.protocol_version == "HTTP/1.0" and headers["Connection"]:
+            headers["Connection"] = "close"
         self.headers = headers
         self.data = data
 
