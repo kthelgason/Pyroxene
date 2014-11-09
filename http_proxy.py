@@ -7,7 +7,11 @@ An event-driven proxy server.
 license: 2-Clause BSD License.
 
 The server listens for incoming connections on it's port, given in
-a command-line argument, and spawns
+a command-line argument. The server uses epoll to poll file descriptors
+to determine if they are ready to send/recieve data. Read events on the
+server socket are new connections being established. We create a ProxyContext
+instance to handle the connection between that client and the servers it
+talks to.
 
 """
 from __future__ import print_function, with_statement
@@ -22,10 +26,15 @@ import signal
 import argparse
 import threading
 import urlparse
+import time
+import calendar
+import cPickle as pickle
 import cStringIO
 from time import strftime, gmtime, sleep
 from Queue import Queue, Empty
 from proxy_cache import Cache
+from hashlib import md5
+from fnmatch import fnmatch
 
 PROXY_VERSION = "0.1"
 PROXY_NAME = "Pyroxene"
@@ -55,8 +64,6 @@ STATUS_CODES = {
 We define a few custom exceptions to better indicate
 what happened.
 """
-
-
 class LoggerException(Exception):
     pass
 
@@ -130,6 +137,191 @@ class Logger(object):
                 f.write(timestamp + self.logfmt % args)
 
 
+class DateTimeParser():
+    """
+    Contains methods to parse date strings to unix time
+    """
+    def __init__(self):
+        pass
+
+    weekdayname = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+    monthname = [None,
+                 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    weekdayname_lower = [name.lower() for name in weekdayname]
+    monthname_lower = [name and name.lower() for name in monthname]
+
+    @classmethod
+    def timegm(cls, year, month, day, hour, minute, second):
+        """
+        Convert time tuple in GMT to seconds since epoch, GMT
+        """
+        EPOCH = 1970
+        if year < EPOCH:
+            raise ValueError("Years prior to %d not supported" % (EPOCH,))
+        assert 1 <= month <= 12
+        days = 365*(year-EPOCH) + calendar.leapdays(EPOCH, year)
+        for i in range(1, month):
+            days = days + calendar.mdays[i]
+        if month > 2 and calendar.isleap(year):
+            days += 1
+        days = days + day - 1
+        hours = days*24 + hour
+        minutes = hours*60 + minute
+        seconds = minutes*60 + second
+        return seconds
+
+    @classmethod
+    def stringToDatetime(cls, dateString):
+        """
+        Convert an HTTP date string (one of three formats)
+        to seconds since epoch.
+        """
+        parts = dateString.split()
+
+        if not parts[0][0:3].lower() in cls.weekdayname_lower:
+            # Weekday might be omitted.
+            try:
+                return cls.stringToDatetime(b"Sun, " + dateString)
+            except ValueError:
+                # Guess not.
+                pass
+
+        partlen = len(parts)
+        if (partlen == 5 or partlen == 6) and parts[1].isdigit():
+            # 1st date format: Sun, 06 Nov 1994 08:49:37 GMT
+            day = parts[1]
+            month = parts[2]
+            year = parts[3]
+            time = parts[4]
+        elif (partlen == 3 or partlen == 4) and parts[1].find('-') != -1:
+            # 2nd date format: Sunday, 06-Nov-94 08:49:37 GMT
+            day, month, year = parts[1].split('-')
+            time = parts[2]
+            year = int(year)
+            if year < 69:
+                year += 2000
+            elif year < 100:
+                year += 1900
+        elif len(parts) == 5:
+            # 3rd date format: Sun Nov  6 08:49:37 1994
+            # ANSI C asctime() format.
+            day = parts[2]
+            month = parts[1]
+            year = parts[4]
+            time = parts[3]
+        else:
+            raise ValueError("Unknown datetime format %r" % dateString)
+
+        day = int(day)
+        month = int(cls.monthname_lower.index(month.lower()))
+        year = int(year)
+        hour, min_, sec = map(int, time.split(':'))
+        return int(cls.timegm(year, month, day, hour, min_, sec))
+
+
+class CacheEntry():
+    """
+    Class associated with an entry in the cache.
+    Keeps track of the ttl of entries
+    """
+    def __init__(self, key, response, ttl):
+        self.ttl = ttl
+        self.key = key
+        with open(os.path.join(CACHE_DIR, key), 'w+') as f:
+            pickle.dump(response, f)
+
+    def data(self):
+        """
+        Read the stored response from the cache
+        and return a Response object
+        """
+        with open(os.path.join(CACHE_DIR, self.key), 'r') as f:
+            data = pickle.load(f)
+        if not self.is_fresh():
+            data.needs_validation = True
+        return data
+
+    def is_fresh(self):
+        return time.time() < self.ttl
+
+
+class Cache():
+    def __init__(self):
+        self.map = {}
+
+    def key_from_message(self, response):
+        """
+        Construct a cache-key from the response object
+        by calculating the md5 hash of the URI and any
+        `vary` header values that may be present.
+        """
+        # TODO: handle Vary: *
+        key = response.abs_resource
+        vary = response.get_header("Vary")
+        if vary:
+            for hf in vary.split(","):
+                # if this header is present in the response,
+                # add it to the digest
+                key += response.get_header(hf) or ''
+        key = md5(key).hexdigest()
+        return key
+
+    def should_cache(self, request, response):
+        """
+        Determines whether the response should be cached
+        according to the RFC. If the response should be cached,
+        this method returns it's expiration time.
+        """
+        if request.method != "GET" or response.status != "200":
+            return None
+        resp_directives = response.get_header("Cache-Control")
+        req_directives = request.get_header("Cache-Control")
+        if req_directives:
+            req_directives = map(lambda x: x.strip().lower(),
+                    req_directives.split(","))
+            for directive in req_directives:
+                if fnmatch("no-store", directive):
+                    return None
+                if fnmatch("no-cache", directive):
+                    return None
+        if request.get_header("Authorization"):
+            return None
+        if request.get_header("Cookie"):
+            return None
+        if resp_directives:
+            resp_directives = map(lambda x: x.strip().lower(),
+                    resp_directives.split(","))
+            for directive in resp_directives:
+                if fnmatch("no-store", directive):
+                    return None
+                if fnmatch("private", directive):
+                    return None
+                if fnmatch("s-maxage*", directive):
+                    return time.time() + float(directive.split("=")[1])
+                if fnmatch(directive, "max-age*"):
+                    return time.time() + float(directive.split("=")[1])
+        expires = response.get_header("Expires")
+        date = response.get_header("Date")
+        if expires and date:
+            try:
+                return DateTimeParser.stringToDatetime(expires)
+            except ValueError as e:
+                pass
+        return None
+
+    def store(self, request, response):
+        ttl = self.should_cache(request, response)
+        if ttl:
+            key = self.key_from_message(request)
+            self.map[key] = CacheEntry(key, response, ttl)
+
+    def retrieve(self, request):
+        key = self.key_from_message(request)
+        cached_response = self.map.get(key)
+        return cached_response.data() if cached_response else None
+
+
 class HTTP_Message(object):
     """
     A parent class for HTTP response and requests messages.
@@ -154,9 +346,6 @@ class HTTP_Message(object):
         if self.data:
             raw += self.data
         return raw
-
-    def is_request(self):
-        return self.__class__ == Request
 
 
 class Request(HTTP_Message):
@@ -276,7 +465,6 @@ class HTTPMessageParser(object):
         return None
 
     def create_packet(self):
-        """ Create a packet """
         args = (self._message_line, self._headers, ''.join(self._payload))
         return Request(*args) if self._type == "request" else Response(*args)
 
@@ -296,8 +484,10 @@ class HTTPMessageParser(object):
             self._type = "response"
         elif message_line[0] in SUPPORTED_METHODS:
             self._type = "request"
+        # The response is not malformed, but we don't support HTTP/1.0
         elif "HTTP" in message_line[0]:
             raise RequestError("505")
+        # Malformed packet.
         else:
             raise RequestError("501")
         self._message_line = message_line
@@ -363,6 +553,7 @@ class HTTPMessageParser(object):
         return f
 
     def parse_chunked_data(self, f):
+        """ reads data from a chunked packet """
         if self._data_remaining:
             f, self._data_remaining = self.read_data_length(f, self._data_remaining)
             if self._data_remaining == 0:
