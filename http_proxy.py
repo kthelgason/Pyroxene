@@ -907,6 +907,7 @@ class ProxyContext(object):
 
 
 class ProxyServer(object):
+    """ The main server instance """
     def __init__(self, port, ipv6=False):
         self.port = port
         self.connections = {}
@@ -915,6 +916,7 @@ class ProxyServer(object):
         self.sock = self.initialize_connection(port, ipv6)
 
     def initialize_connection(self, port, ipv6):
+        """ Initialize the main server socket """
         sock_type = socket.AF_INET6 if ipv6 else socket.AF_INET
         sock = socket.socket(sock_type, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -926,15 +928,19 @@ class ProxyServer(object):
         return sock
 
     def register(self, conn, fd, type_):
+        """ Register a connection with epoll """
         self.epoll.register(fd, type_)
         self.connections[fd] = conn
 
     def unregister(self, conn, fd):
+        """ Unregister and delete a connection """
         host = conn.get_host(fd)
         host.sock.close()
         del self.connections[fd]
         self.epoll.unregister(fd)
 
+    """ The following three methods are callbacks
+    for the Context class to manipulate epoll """
     def on_disconnect_callback(self, fd):
         self.unregister(self.connections[fd], fd)
 
@@ -950,9 +956,11 @@ class ProxyServer(object):
         self.epoll.modify(fd, select.EPOLLOUT | select.EPOLLIN)
 
     def on_send_callback(self, fd):
+        # Only called when the packet queue is empty.
         self.epoll.modify(fd, select.EPOLLIN)
 
     def start(self):
+        """ Main busy loop """
         try:
             while True:
                 events = self.epoll.poll(1)
@@ -969,6 +977,7 @@ class ProxyServer(object):
                     except KeyError:
                         continue
         finally:
+            # Ensure everything is cleaned up nicely =)
             self.epoll.unregister(self.sock.fileno())
             self.epoll.close()
             self.sock.close()
