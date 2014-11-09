@@ -13,6 +13,9 @@ server socket are new connections being established. We create a ProxyContext
 instance to handle the connection between that client and the servers it
 talks to.
 
+As an extra nice feature we support HTTPS tunneling with the CONNECT
+method.
+
 """
 from __future__ import print_function, with_statement
 
