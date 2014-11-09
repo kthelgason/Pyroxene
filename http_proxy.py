@@ -23,7 +23,7 @@ import argparse
 import threading
 import urlparse
 import cStringIO
-from time import strftime, gmtime
+from time import strftime, gmtime, sleep
 from Queue import Queue, Empty
 from proxy_cache import Cache
 
@@ -187,8 +187,8 @@ class Request(HTTP_Message):
             # replace the Host header field with the value from the resource
             # string, as per RFC 7230.
             headers["Host"], self.port = url.hostname, url.port if url.port else 80
-        if self.method == "POST" and headers["Connection"]:
-            headers["Connection"] = "close"
+        #if self.method == "POST":
+        #    print(len(data))
         self.url = headers.get("Host")
         self.headers = headers
         self.data = data
@@ -237,6 +237,8 @@ class HTTPMessageParser(object):
         self._headers = {}
         self._payload = []
         self._type = None
+        self._key = None
+        self._value = None
         self._data_remaining = None
         self._state = PARSER_STATE_NONE
 
@@ -308,6 +310,12 @@ class HTTPMessageParser(object):
         # Possible empty line at start of headers
         if header == CRLF:
             header = f.readline()
+        # Finish entering the long value from before
+        if self._key and self._value:
+            self._headers[self._key] = self._value + header
+            self._value = None
+            self._key = None
+            header = f.readline()
         while header and header != CRLF:
             parts = header.split(':', 1)
             key = parts[0]
@@ -317,6 +325,8 @@ class HTTPMessageParser(object):
             # Empty line in middle of headers indicates we have yet
             # to recieve more.
             if not header:
+                self._key = key
+                self._value = value
                 return f
         # Add via header
         via = self._headers.get("Via")
@@ -447,12 +457,12 @@ class HTTPConnection(object):
             # Each connection has a message buffer that stores the entire
             # message recieved.
             self.recv_buffer += data
-            # Check to see if we have a complete packet.
             if self.https:
                 packet = self.recv_buffer
             else:
                 packet = self.parser.try_parse(data)
 
+            # Check to see if we have a complete packet.
             if packet:
                 # Reset connection state to get ready for next read.
                 self.recv_buffer = b''
@@ -743,7 +753,7 @@ class ProxyServer(object):
         conn = ProxyContext(client_sock, client_addr, self.cache, self.register,
                             self.on_read_callback, self.on_send_callback,
                             self.on_disconnect_callback)
-        self.register(conn, client_sock.fileno(), select.EPOLLIN)
+        self.register(conn, client_sock.fileno(), select.EPOLLIN | select.EPOLLOUT)
 
     def on_read_callback(self, fd):
         self.epoll.modify(fd, select.EPOLLOUT | select.EPOLLIN)
