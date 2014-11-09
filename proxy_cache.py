@@ -9,7 +9,10 @@ from fnmatch import fnmatch
 
 CACHE_DIR = os.path.abspath("cache")
 
+
 class DateTimeParser():
+    def __init__(self):
+        pass
 
     weekdayname = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
     monthname = [None,
@@ -19,7 +22,7 @@ class DateTimeParser():
     monthname_lower = [name and name.lower() for name in monthname]
 
     @classmethod
-    def timegm(klass, year, month, day, hour, minute, second):
+    def timegm(cls, year, month, day, hour, minute, second):
         """
         Convert time tuple in GMT to seconds since epoch, GMT
         """
@@ -31,7 +34,7 @@ class DateTimeParser():
         for i in range(1, month):
             days = days + calendar.mdays[i]
         if month > 2 and calendar.isleap(year):
-            days = days + 1
+            days += 1
         days = days + day - 1
         hours = days*24 + hour
         minutes = hours*60 + minute
@@ -39,17 +42,17 @@ class DateTimeParser():
         return seconds
 
     @classmethod
-    def stringToDatetime(klass, dateString):
+    def stringToDatetime(cls, dateString):
         """
         Convert an HTTP date string (one of three formats)
         to seconds since epoch.
         """
         parts = dateString.split()
 
-        if not parts[0][0:3].lower() in klass.weekdayname_lower:
+        if not parts[0][0:3].lower() in cls.weekdayname_lower:
             # Weekday might be omitted.
             try:
-                return klass.stringToDatetime(b"Sun, " + dateString)
+                return cls.stringToDatetime(b"Sun, " + dateString)
             except ValueError:
                 # Guess not.
                 pass
@@ -65,11 +68,11 @@ class DateTimeParser():
             # 2nd date format: Sunday, 06-Nov-94 08:49:37 GMT
             day, month, year = parts[1].split('-')
             time = parts[2]
-            year=int(year)
+            year = int(year)
             if year < 69:
-                year = year + 2000
+                year += 2000
             elif year < 100:
-                year = year + 1900
+                year += 1900
         elif len(parts) == 5:
             # 3rd date format: Sun Nov  6 08:49:37 1994
             # ANSI C asctime() format.
@@ -81,10 +84,10 @@ class DateTimeParser():
             raise ValueError("Unknown datetime format %r" % dateString)
 
         day = int(day)
-        month = int(klass.monthname_lower.index(month.lower()))
+        month = int(cls.monthname_lower.index(month.lower()))
         year = int(year)
         hour, min_, sec = map(int, time.split(':'))
-        return int(klass.timegm(year, month, day, hour, min_, sec))
+        return int(cls.timegm(year, month, day, hour, min_, sec))
 
 
 class CacheEntry():
@@ -104,6 +107,7 @@ class CacheEntry():
 
     def is_fresh(self):
         return time.time() < self.ttl
+
 
 class Cache():
     def __init__(self):
@@ -146,6 +150,8 @@ class Cache():
                     return None
         if request.get_header("Authorization"):
             return None
+        if request.get_header("Cookie"):
+            return None
         if resp_directives:
             resp_directives = map(lambda x: x.strip().lower(),
                     resp_directives.split(","))
@@ -162,7 +168,7 @@ class Cache():
         date = response.get_header("Date")
         if expires and date:
             try:
-                return (DateTimeParser.stringToDatetime(expires))
+                return DateTimeParser.stringToDatetime(expires)
             except ValueError as e:
                 pass
         return None
@@ -177,5 +183,6 @@ class Cache():
         key = self.key_from_message(request)
         cached_response = self.map.get(key)
         return cached_response.data() if cached_response else None
+
 
 

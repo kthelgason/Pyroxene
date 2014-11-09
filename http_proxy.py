@@ -25,7 +25,6 @@ import urlparse
 import cStringIO
 from time import strftime, gmtime
 from Queue import Queue, Empty
-
 from proxy_cache import Cache
 
 PROXY_VERSION = "0.1"
@@ -39,33 +38,36 @@ CRLF = '\r\n'
 CACHE_DIR = os.path.abspath("cache")
 
 CONNECTION_ESTABLISHED = CRLF.join([
-            'HTTP/1.1 200 Connection established',
-            'Proxy-agent: {}'.format(VIA),
-            CRLF
-        ])
+    'HTTP/1.1 200 Connection established',
+    'Proxy-agent: {}'.format(VIA), CRLF
+])
 
 PARSER_STATE_NONE, PARSER_STATE_LINE, PARSER_STATE_HEADERS, PARSER_STATE_DATA, PARSER_STATE_ERROR = range(5)
 
 STATUS_CODES = {
-        "400" : "Bad Request\r\n",
-        "404" : "Not Found\r\n",
-        "501" : "Not Implemented\r\n",
-        "505" : "HTTP Version Not Supported\r\n"
-        }
+    "400": "Bad Request\r\n",
+    "404": "Not Found\r\n",
+    "501": "Not Implemented\r\n",
+    "505": "HTTP Version Not Supported\r\n"
+}
 
 """
 We define a few custom exceptions to better indicate
 what happened.
 """
 
+
 class LoggerException(Exception):
     pass
+
 
 class parseException(Exception):
     pass
 
+
 class EmptySocketException(Exception):
     pass
+
 
 class RequestError(Exception):
     """
@@ -73,6 +75,7 @@ class RequestError(Exception):
     and that a response with statuscode `code`
     should be sent to the client
     """
+
     def __init__(self, code):
         self.code = code
 
@@ -93,17 +96,17 @@ class Logger(object):
     _instance = None
 
     @classmethod
-    def instance(klass):
+    def instance(cls):
         """
         Returns a shared instance of the class.
         Uses locks to ensure no contest between multiple
         threads trying to access it concurrently.
         """
-        if not klass._instance:
-            with klass._instance_lock:
-                if not klass._instance:
-                    klass._instance = klass()
-        return klass._instance
+        if not cls._instance:
+            with cls._instance_lock:
+                if not cls._instance:
+                    cls._instance = cls()
+        return cls._instance
 
     def __init__(self):
         self.logfmt = " : %s:%d %s %s : %s %s\n"
@@ -132,8 +135,10 @@ class HTTP_Message(object):
     A parent class for HTTP response and requests messages.
     This class is never instatiated directly.
     """
+
     def __init__(self, headers, data):
-        pass
+        self.headers = headers
+        self.data = data
 
     def get_header(self, key):
         return self.headers.get(key)
@@ -143,7 +148,7 @@ class HTTP_Message(object):
         return a raw string representation of the packet.
         """
         raw = ''
-        for (key,value) in self.headers.iteritems():
+        for (key, value) in self.headers.iteritems():
             raw += key + ": " + value + CRLF
         raw += CRLF
         if self.data:
@@ -160,6 +165,7 @@ class Request(HTTP_Message):
     The initializer deals with rewriting headers and other
     duties a proxy should perform.
     """
+
     def __init__(self, req_line, headers, data):
         super(Request, self).__init__(headers, data)
         self.method, self.resource, self.protocol_version = req_line
@@ -195,11 +201,13 @@ class Request(HTTP_Message):
 
 class Response(HTTP_Message):
     def __init__(self, resp_line, headers, data):
+        super(Response, self).__init__(headers, data)
         # This fixes responses that do not include a reason
         if len(resp_line) < 3: resp_line.append('')
         self.protocol_version, self.status, self.reason = resp_line
         if self.protocol_version == "HTTP/1.0" and headers["Connection"]:
             headers["Connection"] = "close"
+
         if self.status != "200":
             headers["Connection"] = "close"
         self.headers = headers
@@ -233,7 +241,7 @@ class HTTPMessageParser(object):
         self._state = PARSER_STATE_NONE
 
     @classmethod
-    def validation_packet_for_request(klass, request, last_modified):
+    def validation_packet_for_request(cls, request, last_modified):
         headers = request.headers
         headers["If-Modified-Since"] = last_modified
         host = headers["Host"]
@@ -242,10 +250,10 @@ class HTTPMessageParser(object):
         return Request(message_line, headers, "")
 
     @classmethod
-    def error_packet_for_code(klass, code):
+    def error_packet_for_code(cls, code):
         return Response(["HTTP/1.1", code, STATUS_CODES[code]],
-                {"Content-Length" : "0", "Connection" : "close", "Server": VIA},
-                "")
+                        {"Content-Length": "0", "Connection": "close", "Server": VIA},
+                        "")
 
     def try_parse(self, buffer_):
         """
@@ -260,7 +268,7 @@ class HTTPMessageParser(object):
         if self._state == PARSER_STATE_LINE:
             f = self.parse_message_headers(f)
         if self._state == PARSER_STATE_HEADERS:
-            f = self.parse_message_data(f)
+            self.parse_message_data(f)
         if self._state == PARSER_STATE_DATA:
             return self.create_packet()
         return None
@@ -331,7 +339,6 @@ class HTTPMessageParser(object):
         encoding = self._headers.get("Transfer-Encoding")
         if not encoding:
             encoding = self._headers.get("transfer-encoding")
-        payload = b''
         if length:
             if not self._data_remaining:
                 self._data_remaining = int(length)
@@ -368,7 +375,7 @@ class HTTPMessageParser(object):
             if chunk_length == 0:
                 self._payload.append(CRLF)
                 if len(self._payload) < 8:
-                    #First chunk has length 0
+                    # First chunk has length 0
                     self._headers["Connection"] = "close"
                 self._state = PARSER_STATE_DATA
                 return f
@@ -473,7 +480,7 @@ class HTTPConnection(object):
         if not self.message_buffer:
             try:
                 packet = self.packet_queue.get(False)
-            except Empty as e:
+            except Empty:
                 return True
             if not self.https:
                 self.message_buffer = packet.toRaw()
@@ -501,13 +508,14 @@ class ProxyContext(object):
     Server connections are tracked in a dict indexed by file descriptor and by
     hostname. Each server appears twice in the dict for this reason.
     """
+
     def __init__(self, sock, addr,
                  cache,
                  register_callback,
                  recv_callback,
                  send_callback,
                  disconnect_callback
-                ):
+    ):
         self.client = HTTPConnection(sock, addr)
         self.cache = cache
         self.servers = {}
@@ -525,16 +533,18 @@ class ProxyContext(object):
         is invalid.
         """
         name = ""
+
         # Signal handler raises error
         def handler(signum, frame):
             raise Exception("timed out!")
+
         signal.signal(signal.SIGALRM, handler)
         # send SIGALRM to ourselves in 1 sec.
         signal.alarm(2)
         try:
             name = socket.gethostbyname(host)
         # Catch exception thrown by signal handler if timout has expired.
-        except Exception as e:
+        except Exception:
             pass
         # If gethostbyname succeeds we unregister the signal handler.
         signal.signal(signal.SIGALRM, signal.SIG_IGN)
@@ -557,7 +567,7 @@ class ProxyContext(object):
                 self.servers[sock.fileno()] = server
                 self.servers[host] = server
                 self.register(self, sock.fileno(), select.EPOLLIN | select.EPOLLOUT)
-            except socket.timeout as e:
+            except Exception, socket.timeout:
                 return False
         return True
 
@@ -569,15 +579,15 @@ class ProxyContext(object):
         last_modified = response.get_header("Last-Modified")
         if last_modified:
             packet = HTTPMessageParser.validation_packet_for_request(
-                    request, last_modified)
+                request, last_modified)
             self.handle_packet(None, packet, None, True)
 
     def handle_secure_packet(self, packet, host):
         if host == self.client:
-                server = self.servers.get(host.request.url)
-                if server:
-                    server.enqueue(packet)
-                    self.on_recv(server.sock.fileno())
+            server = self.servers.get(host.request.url)
+            if server:
+                server.enqueue(packet)
+                self.on_recv(server.sock.fileno())
         else:
             self.client.enqueue(packet)
             self.on_recv(self.client.sock.fileno())
@@ -590,7 +600,6 @@ class ProxyContext(object):
             cached_response = self.cache.retrieve(packet)
             # A cached response was available
             if cached_response and not nocache:
-                print("Cache hit")
                 # Validate it if it's not fresh
                 if cached_response.needs_validation:
                     self.validate_response(packet, cached_response)
@@ -622,13 +631,12 @@ class ProxyContext(object):
                                   request.abs_resource,
                                   packet.status,
                                   packet.reason
-                                 )
+            )
             if packet.status == "304":
                 # Response successfully validated.
                 # Retrieve it from cache and send to the client.
                 cached_response = self.cache.retrieve(request)
                 if cached_response:
-                    print("Cache retrieved")
                     self.handle_packet(None, cached_response, request, nocache=True)
                     return
             if not nocache:
@@ -674,7 +682,7 @@ class ProxyContext(object):
                 if self.close_connection and host != self.client:
                     # Close the server that sent Connection: close
                     self.close(host)
-        except EmptySocketException as e:
+        except EmptySocketException:
             # Recieved EOF from socket
             if host == self.client:
                 self.close_all()
@@ -698,11 +706,11 @@ class ProxyContext(object):
 
 
 class ProxyServer(object):
-
     def __init__(self, port, ipv6=False):
         self.port = port
         self.connections = {}
         self.cache = Cache()
+        self.epoll = select.epoll()
         self.sock = self.initialize_connection(port, ipv6)
 
     def initialize_connection(self, port, ipv6):
@@ -713,7 +721,6 @@ class ProxyServer(object):
         sock.listen(5)
         sock.setblocking(0)
 
-        self.epoll = select.epoll()
         self.epoll.register(sock.fileno(), select.EPOLLIN)
         return sock
 
@@ -730,7 +737,7 @@ class ProxyServer(object):
     def on_disconnect_callback(self, fd):
         self.unregister(self.connections[fd], fd)
 
-    def accept_connection(self, fd):
+    def accept_connection(self):
         client_sock, client_addr = self.sock.accept()
         client_sock.setblocking(0)
         conn = ProxyContext(client_sock, client_addr, self.cache, self.register,
@@ -751,7 +758,7 @@ class ProxyServer(object):
                 for fileno, event in events:
                     try:
                         if fileno == self.sock.fileno():
-                            self.accept_connection(fileno)
+                            self.accept_connection()
                         elif event & select.EPOLLIN:
                             self.connections[fileno].recv(fileno)
                         elif event & select.EPOLLOUT:
@@ -768,7 +775,7 @@ class ProxyServer(object):
 
 def main():
     parser = argparse.ArgumentParser(
-            description="A full-featured http proxy server.")
+        description="A full-featured http proxy server.")
     parser.add_argument('port', type=int, help="The port to start the server on")
     parser.add_argument('logfile', help='The logfile to log connections to')
     parser.add_argument('--ipv6', action="store_true", help="Use IPv6")
